@@ -12,9 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"] }
-ruff_python_parser = "0.3"
-ruff_python_ast = "0.3"
-ruff_text_size = "0.3"
+rustpython-parser = "0.3"
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }
 rayon = "1.8"
 dashmap = "5.5"
@@ -31,7 +29,3 @@ parking_lot = "0.12"
 criterion = "0.5"
 tempfile = "3.10"
 proptest = "1.4"
-
-[[bench]]
-name = "benchmarks"
-harness = false
