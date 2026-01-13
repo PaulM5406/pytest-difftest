@@ -14,27 +14,39 @@ use std::time::UNIX_EPOCH;
 use crate::fingerprint::calculate_fingerprint_internal;
 use crate::types::Fingerprint;
 
+/// Default maximum cache size (number of fingerprints)
+/// Set to 100,000 to support large codebases while limiting memory usage
+/// At ~5KB per fingerprint, this caps cache at ~500MB worst case
+const DEFAULT_MAX_SIZE: usize = 100_000;
+
 /// In-memory cache for fingerprints
 ///
 /// This cache stores parsed fingerprints to avoid re-parsing the same files
 /// repeatedly during a test run. It's especially effective when multiple tests
 /// touch the same source files.
+///
+/// The cache has a configurable maximum size to prevent unbounded memory growth
+/// on large codebases. When the limit is reached, 10% of entries are evicted.
 #[pyclass(unsendable)]
 pub struct FingerprintCache {
     // Cache: filepath -> (mtime, fingerprint)
     cache: Arc<RwLock<HashMap<String, (f64, Fingerprint)>>>,
     hits: Arc<RwLock<usize>>,
     misses: Arc<RwLock<usize>>,
+    max_size: usize,
 }
 
 #[pymethods]
 impl FingerprintCache {
+    /// Create a new cache with default maximum size
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (max_size=None))]
+    pub fn new(max_size: Option<usize>) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             hits: Arc::new(RwLock::new(0)),
             misses: Arc::new(RwLock::new(0)),
+            max_size: max_size.unwrap_or(DEFAULT_MAX_SIZE),
         }
     }
 
@@ -72,6 +84,11 @@ impl FingerprintCache {
     pub fn size(&self) -> usize {
         self.cache.read().len()
     }
+
+    /// Get maximum cache size
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
 }
 
 impl FingerprintCache {
@@ -102,12 +119,35 @@ impl FingerprintCache {
         *self.misses.write() += 1;
         let fingerprint = calculate_fingerprint_internal(path)?;
 
-        // Update cache
+        // Update cache with size limit enforcement
         {
             let mut cache = self.cache.write();
+
+            // Evict entries if cache is full
+            if cache.len() >= self.max_size {
+                self.evict_entries(&mut cache);
+            }
+
             cache.insert(path.to_string(), (current_mtime, fingerprint.clone()));
         }
 
         Ok(fingerprint)
+    }
+
+    /// Evict 10% of cache entries when limit is reached
+    ///
+    /// Uses a simple strategy: remove arbitrary entries (HashMap iteration order).
+    /// This is fast and provides reasonable eviction behavior.
+    fn evict_entries(&self, cache: &mut HashMap<String, (f64, Fingerprint)>) {
+        let to_remove = self.max_size / 10;
+        let keys_to_remove: Vec<String> = cache
+            .keys()
+            .take(to_remove.max(1))
+            .cloned()
+            .collect();
+
+        for key in keys_to_remove {
+            cache.remove(&key);
+        }
     }
 }

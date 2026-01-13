@@ -57,7 +57,11 @@ class TestmonPlugin:
         self.test_execution_batch = []
         # Adaptive batch size based on total test count
         # For large test suites, larger batches = better performance
-        self.batch_size = config.getoption("--diff-batch-size", 20)
+        # Check command line first, then ini option
+        self.batch_size = self._get_config_value(config, "batch-size", "batch_size", 20)
+
+        # Cache size for fingerprints (configurable for large codebases)
+        self.cache_max_size = self._get_config_value(config, "cache-size", "cache_size", 100_000)
 
         # Get pytest invocation scope (e.g., if user runs 'pytest tests/unit/')
         # We'll use this to only track files within the specified scope
@@ -71,6 +75,29 @@ class TestmonPlugin:
             import time
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] pytest-diff: {message}")
+
+    @staticmethod
+    def _get_config_value(config, cli_name: str, ini_name: str, default: int) -> int:
+        """Get config value from CLI option or ini file, with fallback to default.
+
+        CLI options take precedence over ini options. Supports configuration via:
+        - Command line: --diff-{cli_name}
+        - pyproject.toml: [tool.pytest.ini_options] diff_{ini_name} = value
+        """
+        # Check if CLI option was explicitly provided
+        cli_value = config.getoption(f"--diff-{cli_name}", None)
+        if cli_value is not None:
+            return cli_value
+
+        # Check ini option (from pyproject.toml or pytest.ini)
+        ini_value = config.getini(f"diff_{ini_name}")
+        if ini_value:
+            try:
+                return int(ini_value)
+            except (ValueError, TypeError):
+                pass
+
+        return default
 
     def _get_scope_paths(self, config):
         """Get the absolute paths that define the pytest invocation scope.
@@ -153,10 +180,10 @@ class TestmonPlugin:
                 self.enabled = False
                 return
 
-        # Initialize fingerprint cache
+        # Initialize fingerprint cache with configurable size
         cache_start = time.time()
-        self.fp_cache = _core.FingerprintCache()
-        self._log(f"Fingerprint cache initialized in {time.time() - cache_start:.3f}s")
+        self.fp_cache = _core.FingerprintCache(self.cache_max_size)
+        self._log(f"Fingerprint cache initialized (max_size={self.cache_max_size}) in {time.time() - cache_start:.3f}s")
 
         # Initialize coverage if available
         coverage_module = None
@@ -412,7 +439,14 @@ class TestmonPlugin:
 
 
 def pytest_addoption(parser):
-    """Add command-line options for pytest-diff"""
+    """Add command-line options for pytest-diff
+
+    Options can also be set in pyproject.toml under [tool.pytest.ini_options]:
+
+        [tool.pytest.ini_options]
+        diff_batch_size = 50
+        diff_cache_size = 200000
+    """
     group = parser.getgroup("diff", "pytest-diff test selection")
 
     group.addoption(
@@ -438,6 +472,27 @@ def pytest_addoption(parser):
         type=int,
         default=20,
         help="Number of test executions to batch before DB write (default: 20, larger = faster but more memory)",
+    )
+
+    group.addoption(
+        "--diff-cache-size",
+        type=int,
+        default=100_000,
+        help="Maximum fingerprints to cache in memory (default: 100000, increase for very large codebases)",
+    )
+
+    # Register ini options for pyproject.toml configuration
+    parser.addini(
+        "diff_batch_size",
+        type="string",
+        default="20",
+        help="Number of test executions to batch before DB write",
+    )
+    parser.addini(
+        "diff_cache_size",
+        type="string",
+        default="100000",
+        help="Maximum fingerprints to cache in memory",
     )
 
 

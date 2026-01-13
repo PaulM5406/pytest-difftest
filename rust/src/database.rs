@@ -4,18 +4,22 @@
 // - SQLite database operations for test executions and fingerprints
 // - In-memory caching for hot paths
 // - Prepared statement management
-// - Concurrent access support (WAL mode)
+// - Concurrent access support (WAL mode + busy timeout)
+// - Automatic cleanup of old test executions
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::cache::Cache;
 use crate::types::Fingerprint;
+
+/// Default busy timeout in milliseconds for concurrent access
+const BUSY_TIMEOUT_MS: i32 = 30_000; // 30 seconds
 
 /// Main database interface for pytest-diff
 ///
@@ -49,6 +53,11 @@ impl TestmonDatabase {
 
         let conn =
             Connection::open(path).with_context(|| format!("Failed to open database: {}", path))?;
+
+        // Set busy timeout FIRST for concurrent access (pytest-xdist compatibility)
+        // This makes SQLite retry for up to BUSY_TIMEOUT_MS when database is locked
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64))
+            .context("Failed to set busy timeout")?;
 
         // Apply performance optimizations
         conn.execute_batch(
@@ -400,7 +409,18 @@ impl TestmonDatabase {
         let env_id = self.get_or_create_environment("default", python_version)?;
 
         let mut conn = self.conn.write();
-        let tx = conn.transaction()?;
+
+        // Use BEGIN IMMEDIATE for fail-fast on write conflicts (pytest-xdist compatibility)
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Delete previous executions for this test in this environment
+        // This keeps the database from growing unbounded
+        tx.execute(
+            "DELETE FROM test_execution
+             WHERE environment_id = ?1 AND test_name = ?2",
+            params![env_id, test_name],
+        )
+        .context("Failed to delete old test execution")?;
 
         // Insert test execution
         tx.execute(
@@ -470,42 +490,74 @@ impl TestmonDatabase {
         }
 
         let conn = self.conn.read();
-        let mut all_tests = Vec::new();
 
-        for (filename, checksums) in changed_blocks {
-            // Get all fingerprints for this file along with their checksums
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT te.test_name, fp.method_checksums
-                 FROM test_execution te
-                 JOIN test_execution_file_fp teff ON te.id = teff.test_execution_id
-                 JOIN file_fp fp ON teff.fingerprint_id = fp.id
-                 WHERE fp.filename = ?1",
-            )?;
+        // Build a single query for all changed files (more efficient than N queries)
+        let filenames: Vec<&str> = changed_blocks.keys().map(|s| s.as_str()).collect();
 
-            let tests: Vec<String> = stmt
-                .query_map(params![filename], |row| {
-                    let test_name: String = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    Ok((test_name, blob))
-                })?
-                .filter_map(|r| r.ok())
-                .filter(|(_, blob)| {
-                    // Deserialize the checksums and check if any match
-                    let file_checksums = deserialize_checksums(blob);
-                    // If any of the changed checksums are in this file's checksums, include the test
-                    checksums.iter().any(|c| file_checksums.contains(c))
-                })
-                .map(|(test_name, _)| test_name)
-                .collect();
+        // Create placeholders for IN clause: (?1, ?2, ?3, ...)
+        let placeholders: String = (1..=filenames.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-            all_tests.extend(tests);
+        let query = format!(
+            "SELECT DISTINCT te.test_name, fp.filename, fp.method_checksums
+             FROM test_execution te
+             JOIN test_execution_file_fp teff ON te.id = teff.test_execution_id
+             JOIN file_fp fp ON teff.fingerprint_id = fp.id
+             WHERE fp.filename IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+
+        // Convert filenames to rusqlite params
+        let params: Vec<&dyn rusqlite::ToSql> = filenames
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+
+        // Pre-compute changed checksums as HashSets for O(1) lookup
+        let changed_checksum_sets: HashMap<&str, HashSet<i32>> = changed_blocks
+            .iter()
+            .map(|(filename, checksums)| {
+                (filename.as_str(), checksums.iter().copied().collect())
+            })
+            .collect();
+
+        // Cache deserialized blobs to avoid re-deserializing the same blob
+        let mut blob_cache: HashMap<Vec<u8>, Vec<i32>> = HashMap::new();
+
+        let mut affected_tests: HashSet<String> = HashSet::new();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let test_name: String = row.get(0)?;
+            let filename: String = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            Ok((test_name, filename, blob))
+        })?;
+
+        for row_result in rows {
+            let (test_name, filename, blob) = row_result?;
+
+            // Get or compute deserialized checksums (cache for efficiency)
+            let file_checksums = blob_cache
+                .entry(blob.clone())
+                .or_insert_with(|| deserialize_checksums(&blob));
+
+            // Check if any changed checksum for this file matches
+            if let Some(changed_set) = changed_checksum_sets.get(filename.as_str()) {
+                if file_checksums.iter().any(|c| changed_set.contains(c)) {
+                    affected_tests.insert(test_name);
+                }
+            }
         }
 
-        // Deduplicate
-        all_tests.sort();
-        all_tests.dedup();
+        // Convert HashSet to sorted Vec for consistent ordering
+        let mut result: Vec<String> = affected_tests.into_iter().collect();
+        result.sort();
 
-        Ok(all_tests)
+        Ok(result)
     }
 
     fn get_stats_internal(&self) -> Result<HashMap<String, i64>> {
