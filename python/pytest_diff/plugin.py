@@ -147,6 +147,71 @@ class TestmonPlugin:
 
         return scope_paths if scope_paths else [str(Path(config.rootdir).resolve())]
 
+    @staticmethod
+    def _get_git_commit_sha(rootdir: str) -> str | None:
+        """Get the current HEAD commit SHA from git.
+
+        Returns None if git is unavailable, not a repo, or any error occurs.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=rootdir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+        return None
+
+    @staticmethod
+    def _check_baseline_staleness(baseline_commit: str, rootdir: str) -> str | None:
+        """Check if the baseline commit is stale relative to current HEAD.
+
+        Returns None if the baseline is current, or a warning message string.
+        """
+        import subprocess
+
+        current_sha = TestmonPlugin._get_git_commit_sha(rootdir)
+        if current_sha is None:
+            return None
+
+        if baseline_commit == current_sha:
+            return None
+
+        short_baseline = baseline_commit[:10]
+        short_head = current_sha[:10]
+
+        # Check if baseline_commit is an ancestor of HEAD
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", baseline_commit, "HEAD"],
+                cwd=rootdir,
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return (
+                    f"Baseline was built from commit {short_baseline}, "
+                    f"current HEAD is {short_head}. "
+                    f"Baseline is older but included in your history. "
+                    f"Test selection may not be optimal for newly merged code."
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+        return (
+            f"Baseline is STALE: built from commit {short_baseline} "
+            f"which is NOT in your current history (HEAD={short_head}). "
+            f"Test selection may be unreliable. "
+            f"Consider re-running: pytest --diff-baseline"
+        )
+
     def _flush_test_batch(self):
         """Flush batched test executions to database"""
         if not self.test_execution_batch or self.db is None:
@@ -210,6 +275,15 @@ class TestmonPlugin:
                 f"Imported {count} baseline fingerprints in {time.time() - import_start:.3f}s"
             )
             print(f"✓ pytest-diff: Imported {count} baseline fingerprints from remote")
+
+            # Check baseline staleness via stored commit SHA
+            baseline_commit = self.db.get_metadata("baseline_commit")
+            if baseline_commit:
+                warning = self._check_baseline_staleness(baseline_commit, str(self.config.rootdir))
+                if warning:
+                    print(f"⚠ pytest-diff: {warning}")
+            else:
+                self._log("No baseline_commit metadata found — skipping staleness check")
         except Exception as e:
             print(f"⚠ pytest-diff: Failed to import remote baseline: {e}")
 
@@ -522,6 +596,12 @@ class TestmonPlugin:
                     f"pytest-diff: Baseline saved for {count} files in {elapsed:.3f}s",
                     green=True,
                 )
+
+                # Store git commit SHA in metadata for staleness detection
+                sha = self._get_git_commit_sha(str(self.config.rootdir))
+                if sha and self.db:
+                    self.db.set_metadata("baseline_commit", sha)
+                    self._log(f"Stored baseline commit SHA: {sha[:10]}")
             except Exception as e:
                 terminalreporter.write_sep(
                     "=",

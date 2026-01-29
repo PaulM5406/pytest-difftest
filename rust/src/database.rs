@@ -387,6 +387,20 @@ impl TestmonDatabase {
             })
     }
 
+    /// Store a metadata key-value pair (INSERT OR REPLACE)
+    fn set_metadata(&self, key: &str, value: &str) -> PyResult<()> {
+        self.set_metadata_internal(key, value).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to set metadata: {}", e))
+        })
+    }
+
+    /// Retrieve a metadata value by key, or None if not found
+    fn get_metadata(&self, key: &str) -> PyResult<Option<String>> {
+        self.get_metadata_internal(key).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get metadata: {}", e))
+        })
+    }
+
     /// Close the database and checkpoint WAL to remove -wal and -shm files
     fn close(&self) -> PyResult<()> {
         let conn = self.conn.write();
@@ -653,7 +667,7 @@ impl TestmonDatabase {
         )
         .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
 
-        // Clear existing baselines and bulk-copy from source
+        // Clear existing baselines and bulk-copy from source, plus metadata
         let result = (|| -> Result<usize> {
             conn.execute("DELETE FROM baseline_fp", [])
                 .context("Failed to clear existing baselines")?;
@@ -666,6 +680,14 @@ impl TestmonDatabase {
             )
             .context("Failed to copy baselines from source")?;
 
+            // Also copy metadata rows from source (e.g. baseline_commit SHA)
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (dataid, data)
+                 SELECT dataid, data FROM source_db.metadata",
+                [],
+            )
+            .context("Failed to copy metadata from source")?;
+
             Ok(count)
         })();
 
@@ -674,6 +696,27 @@ impl TestmonDatabase {
             .context("Failed to detach source database")?;
 
         result
+    }
+
+    fn set_metadata_internal(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.write();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (dataid, data) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .context("Failed to set metadata")?;
+        Ok(())
+    }
+
+    fn get_metadata_internal(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.read();
+        conn.query_row(
+            "SELECT data FROM metadata WHERE dataid = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to get metadata")
     }
 
     fn get_baseline_fingerprint_internal(&self, filename: &str) -> Result<Option<Fingerprint>> {
@@ -867,6 +910,72 @@ mod tests {
 
         let result = db.import_baseline_from_internal("/nonexistent/path.db");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_metadata_set_and_get() {
+        let temp_db = NamedTempFile::new().unwrap();
+        let db = TestmonDatabase::new_internal(temp_db.path().to_str().unwrap()).unwrap();
+
+        // Initially missing
+        assert_eq!(db.get_metadata_internal("baseline_commit").unwrap(), None);
+
+        // Set and retrieve
+        db.set_metadata_internal("baseline_commit", "abc123def").unwrap();
+        assert_eq!(
+            db.get_metadata_internal("baseline_commit").unwrap(),
+            Some("abc123def".to_string())
+        );
+
+        // Overwrite
+        db.set_metadata_internal("baseline_commit", "new_sha").unwrap();
+        assert_eq!(
+            db.get_metadata_internal("baseline_commit").unwrap(),
+            Some("new_sha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_baseline_copies_metadata() {
+        // Create source database with baseline + metadata
+        let source_db_file = NamedTempFile::new().unwrap();
+        let mut source_db =
+            TestmonDatabase::new_internal(source_db_file.path().to_str().unwrap()).unwrap();
+
+        let fp = Fingerprint {
+            filename: "src/foo.py".to_string(),
+            checksums: vec![10, 20],
+            file_hash: "hash_foo".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+        source_db.save_baseline_fingerprint_internal(fp).unwrap();
+        source_db
+            .set_metadata_internal("baseline_commit", "source_sha_123")
+            .unwrap();
+        source_db.close_and_checkpoint().unwrap();
+
+        // Create target database
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            TestmonDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        // Verify no metadata initially
+        assert_eq!(
+            target_db.get_metadata_internal("baseline_commit").unwrap(),
+            None
+        );
+
+        // Import from source
+        target_db
+            .import_baseline_from_internal(source_db_file.path().to_str().unwrap())
+            .unwrap();
+
+        // Verify metadata was copied
+        assert_eq!(
+            target_db.get_metadata_internal("baseline_commit").unwrap(),
+            Some("source_sha_123".to_string())
+        );
     }
 
     #[test]
