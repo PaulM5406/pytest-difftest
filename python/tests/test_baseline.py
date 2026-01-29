@@ -48,8 +48,9 @@ def test_baseline_revert_scenario():
 
         # Step 6: Verify NO changes detected (back to baseline!)
         changes = _core.detect_changes(str(db_path), str(tmpdir), scope_paths)
-        assert not changes.has_changes(), \
-            "Should detect NO changes after reverting to baseline - this is the key fix!"
+        assert (
+            not changes.has_changes()
+        ), "Should detect NO changes after reverting to baseline - this is the key fix!"
         assert len(changes.modified) == 0
         assert len(changes.changed_blocks) == 0
 
@@ -104,6 +105,7 @@ def test_baseline_detects_no_change_on_revert():
 
         # Modify the file
         import time
+
         time.sleep(0.01)  # Ensure mtime changes
         module.write_text("def add(a, b):\n    return a + b + 1\n")
 

@@ -36,6 +36,9 @@ dev = [
     "ruff",
     "ty",
 ]
+s3 = [
+    "boto3>=1.26",
+]
 
 [project.urls]
 Homepage = "https://github.com/paulmilesi/pytest-diff"

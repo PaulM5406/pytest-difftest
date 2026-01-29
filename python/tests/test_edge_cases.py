@@ -14,6 +14,7 @@ def test_diff_with_empty_database(pytester):
 def test_syntax_error_in_source(baselined_project):
     """Source file with syntax error doesn't crash plugin."""
     import time
+
     time.sleep(0.01)
     calc = baselined_project.path / "mylib" / "calculator.py"
     calc.write_text("def broken(\n")  # syntax error
@@ -26,6 +27,7 @@ def test_syntax_error_in_source(baselined_project):
 def test_empty_python_file(baselined_project):
     """Empty .py files don't crash fingerprinting."""
     import time
+
     time.sleep(0.01)
     empty = baselined_project.path / "mylib" / "empty.py"
     empty.write_text("")
@@ -54,9 +56,7 @@ def test_database_corruption_recovery(pytester):
 def test_large_test_suite_batching(pytester):
     """50 tests with --diff-batch-size=10 all pass and flush correctly."""
     # Generate 50 test functions
-    test_funcs = "\n".join(
-        f"def test_{i}():\n    assert {i} == {i}\n" for i in range(50)
-    )
+    test_funcs = "\n".join(f"def test_{i}():\n    assert {i} == {i}\n" for i in range(50))
     pytester.makepyfile(test_generated=test_funcs)
 
     result = pytester.runpytest_subprocess(

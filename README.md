@@ -9,15 +9,12 @@
 
 ## What is pytest-diff?
 
-pytest-diff is a pytest plugin that intelligently selects and runs only the tests affected by your code changes. It's like pytest-testmon, but **10-30x faster** thanks to a Rust core.
+pytest-diff is a pytest plugin that intelligently selects and runs only the tests affected by your code changes.
 
 ### Key Features
 
-- ⚡ **10-30x faster** than pytest-testmon on large codebases
 - 🎯 **Smart test selection** - Only runs tests that touch changed code
 - 🔍 **Block-level granularity** - Tracks changes at function/class level, not just files
-- 🔄 **Drop-in replacement** - Compatible with pytest-testmon databases
-- 🐍 **Python 3.8-3.13** - Full support including sys.monitoring on 3.12+
 - 🔧 **pytest-xdist compatible** - Works with parallel test execution
 - 💾 **SQLite storage** - Reliable, portable test dependency database
 
@@ -36,16 +33,16 @@ uv add --dev pytest-diff
 ## Quick Start
 
 ```bash
-# First run: builds the dependency database (runs all tests)
-pytest --diff
+# 1. Save a baseline (runs all tests and records current state)
+pytest --diff-baseline
 
-# Subsequent runs: only runs tests affected by your changes
+# 2. After making changes, run only affected tests
 pytest --diff
 
 # Example output:
-# ==================== test session starts ====================
-# diff: detected 3 changed files
-# diff: selected 12/450 tests (438 deselected)
+# pytest-diff: Detected 3 modified files
+#   Running 12 affected tests
+#   Skipping 438 unaffected tests
 # ==================== 12 passed in 0.8s =====================
 ```
 
@@ -56,7 +53,7 @@ pytest-diff uses a three-phase approach:
 ### 1. **Dependency Tracking** (First Run)
 - Runs all tests with coverage enabled
 - Maps which tests execute which code blocks
-- Stores dependency graph in `.testmondata` SQLite database
+- Stores dependency graph in `.pytest_cache/pytest-diff/pytest_diff.db` SQLite database
 
 ### 2. **Change Detection** (Subsequent Runs)
 - Parses modified files with Rust (blazingly fast!)
@@ -76,53 +73,65 @@ Code Change → AST Parsing (Rust) → Block Checksums → Database Query → Ru
                                                                  used detector.py)
 ```
 
-## Performance Comparison
-
-Tested on real-world projects:
-
-| Project Size | pytest-testmon | pytest-diff | Speedup |
-|--------------|----------------|-------------|---------|
-| 1,000 tests  | 2.5s          | 0.3s        | **8x**  |
-| 10,000 tests | 45s           | 1.2s        | **37x** |
-| 35,000 tests | 180s          | 6s          | **30x** |
-
-*Benchmark: Change detection + test selection phase on MacBook Pro M1*
-
 ## Configuration
 
 ### Command Line Options
 
+| Option | Description |
+|--------|-------------|
+| `--diff` | Enable pytest-diff (select tests based on changes) |
+| `--diff-baseline` | Run all tests and save current state as baseline for change detection |
+| `--diff-v` | Enable verbose logging (shows timing and debug info) |
+| `--diff-batch-size N` | Number of test executions to batch before DB write (default: 20) |
+| `--diff-cache-size N` | Maximum fingerprints to cache in memory (default: 100000) |
+| `--diff-remote URL` | Remote storage URL for baseline DB (e.g. `s3://bucket/prefix/`, `file:///path/`) |
+| `--diff-upload` | Upload baseline DB to remote storage after `--diff-baseline` completes |
+
 ```bash
-# Enable pytest-diff
+# Run only tests affected by your changes
 pytest --diff
 
-# Collect coverage but don't skip tests (useful for rebuilding database)
-pytest --diff --diff-noselect
+# Save baseline (run all tests, record current state)
+pytest --diff-baseline
 
-# Skip coverage collection but still select tests
-pytest --diff --diff-nocollect
+# Save baseline and upload to S3
+pytest --diff-baseline --diff-upload --diff-remote "s3://my-bucket/pytest-diff/"
+
+# Run affected tests, fetching baseline from remote
+pytest --diff --diff-remote "s3://my-bucket/pytest-diff/"
 ```
 
-### pytest.ini / pyproject.toml
+### pyproject.toml
 
-```ini
-[pytest]
-addopts = --diff
-diff_ignore_patterns =
-    migrations/*
-    */tests/*
-```
-
-Or in `pyproject.toml`:
+All options can be configured in `pyproject.toml` so you don't need to pass them on every invocation:
 
 ```toml
 [tool.pytest.ini_options]
-addopts = "--diff"
-diff_ignore_patterns = [
-    "migrations/*",
-    "*/tests/*"
-]
+diff_batch_size = "50"
+diff_cache_size = "200000"
+diff_remote_url = "s3://my-ci-bucket/pytest-diff/"
+diff_remote_key = "baseline.db"
 ```
+
+CLI options take precedence over `pyproject.toml` values when both are provided.
+
+### Remote Baseline Storage
+
+pytest-diff supports storing the baseline database in remote storage, enabling a CI/CD workflow where CI computes the baseline and developers automatically fetch it.
+
+**Supported backends:**
+
+| Scheme | Backend | Requirements |
+|--------|---------|-------------|
+| `s3://bucket/prefix/` | Amazon S3 | `pip install pytest-diff[s3]` |
+| `file:///path/to/dir/` | Local filesystem | None |
+
+**Typical CI/CD workflow:**
+
+1. **CI (on merge to main):** `pytest --diff-baseline --diff-upload --diff-remote "s3://bucket/prefix/"`
+2. **Developer local:** `pytest --diff --diff-remote "s3://bucket/prefix/"` (auto-fetches latest baseline)
+
+S3 uses ETag-based caching to avoid re-downloading unchanged baselines. All remote errors are non-fatal -- if the download fails, tests run normally using the local baseline.
 
 ## Development Setup
 
@@ -175,25 +184,6 @@ pytest-diff-core (Rust)
     └── Database Layer (SQLite + Cache)
 ```
 
-### Why Rust?
-
-The performance bottlenecks in pytest-testmon are:
-
-1. **Coverage.py overhead** (~40-200% slowdown using `sys.settrace`)
-2. **Python AST parsing** (slow on large files)
-3. **Database operations** (Python/SQLite boundary overhead)
-
-pytest-diff addresses these with:
-
-1. **Hybrid Python/Rust coverage** (Rust data structures, optimized for 3.12+)
-2. **Ruff's Python parser** (20-40% faster than Python's ast module)
-3. **Optimized SQLite** (prepared statements, WAL mode, memory-mapped I/O)
-4. **In-memory caching** (DashMap for hot paths)
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
 ### Development Workflow
 
 ```bash
@@ -212,22 +202,10 @@ ruff format python/
 # Lint
 cargo clippy
 ruff check python/
+
+# Typing
+ty check python/
 ```
-
-## Roadmap
-
-### v0.1.0 (Current)
-- [x] Core Rust implementation
-- [x] Basic pytest plugin
-- [x] SQLite database with caching
-- [ ] Python 3.8-3.13 support
-- [ ] pytest-testmon database compatibility
-
-### v0.2.0 (Future)
-- [ ] Source instrumentation for 50-150x speedup
-- [ ] Advanced caching strategies
-- [ ] Visual reporting dashboard
-- [ ] Remote database support
 
 ## License
 
@@ -241,7 +219,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Support
 
-- 📚 [Documentation](https://github.com/paulmilesi/pytest-diff/wiki)
 - 🐛 [Issue Tracker](https://github.com/paulmilesi/pytest-diff/issues)
 - 💬 [Discussions](https://github.com/paulmilesi/pytest-diff/discussions)
 

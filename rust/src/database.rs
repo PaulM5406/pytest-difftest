@@ -373,6 +373,20 @@ impl TestmonDatabase {
         Ok(())
     }
 
+    /// Import baseline fingerprints from another database file using ATTACH DATABASE.
+    ///
+    /// Bulk-copies all `baseline_fp` rows from `source_db_path` into the local database,
+    /// replacing any existing baselines. Returns the number of imported records.
+    fn import_baseline_from(&mut self, source_db_path: &str) -> PyResult<usize> {
+        self.import_baseline_from_internal(source_db_path)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to import baseline: {}",
+                    e
+                ))
+            })
+    }
+
     /// Close the database and checkpoint WAL to remove -wal and -shm files
     fn close(&self) -> PyResult<()> {
         let conn = self.conn.write();
@@ -624,6 +638,44 @@ impl TestmonDatabase {
         Ok(count)
     }
 
+    fn import_baseline_from_internal(&mut self, source_db_path: &str) -> Result<usize> {
+        // Verify source file exists
+        if !Path::new(source_db_path).exists() {
+            anyhow::bail!("Source database does not exist: {}", source_db_path);
+        }
+
+        let conn = self.conn.write();
+
+        // Attach the source database
+        conn.execute(
+            "ATTACH DATABASE ?1 AS source_db",
+            params![source_db_path],
+        )
+        .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
+
+        // Clear existing baselines and bulk-copy from source
+        let result = (|| -> Result<usize> {
+            conn.execute("DELETE FROM baseline_fp", [])
+                .context("Failed to clear existing baselines")?;
+
+            let count = conn.execute(
+                "INSERT INTO baseline_fp (filename, method_checksums, mtime, fsha, created_at)
+                 SELECT filename, method_checksums, mtime, fsha, created_at
+                 FROM source_db.baseline_fp",
+                [],
+            )
+            .context("Failed to copy baselines from source")?;
+
+            Ok(count)
+        })();
+
+        // Always detach, even if the copy failed
+        conn.execute("DETACH DATABASE source_db", [])
+            .context("Failed to detach source database")?;
+
+        result
+    }
+
     fn get_baseline_fingerprint_internal(&self, filename: &str) -> Result<Option<Fingerprint>> {
         let conn = self.conn.read();
 
@@ -753,6 +805,68 @@ mod tests {
         let deserialized = deserialize_checksums(&blob);
 
         assert_eq!(checksums, deserialized);
+    }
+
+    #[test]
+    fn test_import_baseline_from() {
+        // Create source database with baseline fingerprints
+        let source_db_file = NamedTempFile::new().unwrap();
+        let mut source_db =
+            TestmonDatabase::new_internal(source_db_file.path().to_str().unwrap()).unwrap();
+
+        let fp1 = Fingerprint {
+            filename: "src/foo.py".to_string(),
+            checksums: vec![10, 20, 30],
+            file_hash: "hash_foo".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+        let fp2 = Fingerprint {
+            filename: "src/bar.py".to_string(),
+            checksums: vec![40, 50],
+            file_hash: "hash_bar".to_string(),
+            mtime: 2.0,
+            blocks: None,
+        };
+
+        source_db.save_baseline_fingerprint_internal(fp1).unwrap();
+        source_db.save_baseline_fingerprint_internal(fp2).unwrap();
+        source_db.close_and_checkpoint().unwrap();
+
+        // Create target database (empty)
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            TestmonDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        // Verify target has no baselines
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 0);
+
+        // Import from source
+        let count = target_db
+            .import_baseline_from_internal(source_db_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Verify baselines were imported
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 2);
+
+        let imported_fp = target_db
+            .get_baseline_fingerprint_internal("src/foo.py")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_fp.checksums, vec![10, 20, 30]);
+        assert_eq!(imported_fp.file_hash, "hash_foo");
+    }
+
+    #[test]
+    fn test_import_baseline_from_nonexistent() {
+        let temp_db = NamedTempFile::new().unwrap();
+        let mut db = TestmonDatabase::new_internal(temp_db.path().to_str().unwrap()).unwrap();
+
+        let result = db.import_baseline_from_internal("/nonexistent/path.db");
+        assert!(result.is_err());
     }
 
     #[test]

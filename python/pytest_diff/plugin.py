@@ -28,6 +28,7 @@ class TestmonPlugin:
         self.baseline = config.getoption("--diff-baseline", False)
         self.enabled = config.getoption("--diff", False) or self.baseline
         self.verbose = config.getoption("--diff-v", False)
+        self.upload = config.getoption("--diff-upload", False)
 
         if not self.enabled:
             return
@@ -37,13 +38,22 @@ class TestmonPlugin:
                 "pytest-diff Rust core not found. " "Please install with: pip install pytest-diff"
             )
 
+        # Remote storage configuration
+        self.remote_url = (
+            config.getoption("--diff-remote", None) or config.getini("diff_remote_url") or None
+        )
+        self.remote_key = config.getini("diff_remote_key") or "baseline.db"
+        self.storage = None
+
         # Initialize components - store database in pytest cache folder
         cache_dir = Path(config.rootdir) / ".pytest_cache" / "pytest-diff"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = cache_dir / "pytest_diff.db"
         self.db: _core.TestmonDatabase | None = None
         self.cov = None
-        self.fp_cache: _core.FingerprintCache | None = None  # Fingerprint cache for avoiding re-parsing
+        self.fp_cache: _core.FingerprintCache | None = (
+            None  # Fingerprint cache for avoiding re-parsing
+        )
         self.deselected_items = []
         self.current_test = None
         self.test_start_time = None
@@ -51,7 +61,10 @@ class TestmonPlugin:
 
         # Get Python version for environment tracking
         import sys
-        self.python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+        self.python_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        )
 
         # Batch writing for test executions
         self.test_execution_batch = []
@@ -73,6 +86,7 @@ class TestmonPlugin:
         """Log verbose message with timestamp"""
         if self.verbose:
             import time
+
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] pytest-diff: {message}")
 
@@ -124,7 +138,7 @@ class TestmonPlugin:
                 resolved = path.resolve(strict=False)  # Don't fail if path doesn't exist
                 if resolved.is_dir():
                     scope_paths.append(str(resolved))
-                elif resolved.is_file() or file_path.endswith('.py'):
+                elif resolved.is_file() or file_path.endswith(".py"):
                     # For files, use their parent directory as scope
                     scope_paths.append(str(resolved.parent))
             except (OSError, RuntimeError):
@@ -139,11 +153,81 @@ class TestmonPlugin:
             return
 
         import time
+
         flush_start = time.time()
         for nodeid, fingerprints, duration, failed in self.test_execution_batch:
             self.db.save_test_execution(nodeid, fingerprints, duration, failed, self.python_version)
-        self._log(f"Flushed {len(self.test_execution_batch)} test executions to DB in {time.time() - flush_start:.3f}s")
+        self._log(
+            f"Flushed {len(self.test_execution_batch)} test executions to DB in {time.time() - flush_start:.3f}s"
+        )
         self.test_execution_batch = []
+
+    def _init_storage(self):
+        """Lazily initialize the remote storage backend."""
+        if self.storage is not None or not self.remote_url:
+            return
+        try:
+            from pytest_diff.storage import get_storage
+
+            self.storage = get_storage(self.remote_url)
+            if self.storage is None:
+                print(f"⚠ pytest-diff: Unsupported remote URL scheme: {self.remote_url}")
+        except Exception as e:
+            print(f"⚠ pytest-diff: Failed to initialize remote storage: {e}")
+
+    def _download_and_import_baseline(self):
+        """Download remote baseline DB and import via ATTACH."""
+        import tempfile
+        import time
+
+        self._init_storage()
+        if self.storage is None:
+            return
+
+        dl_start = time.time()
+        tmp_path = Path(tempfile.gettempdir()) / "pytest-diff-remote-baseline.db"
+
+        try:
+            downloaded = self.storage.download(self.remote_key, tmp_path)
+            if downloaded:
+                self._log(f"Downloaded remote baseline in {time.time() - dl_start:.3f}s")
+            else:
+                self._log("Remote baseline unchanged (cache hit)")
+        except FileNotFoundError:
+            self._log("No remote baseline found — skipping import")
+            return
+        except Exception as e:
+            print(f"⚠ pytest-diff: Failed to download remote baseline: {e}")
+            return
+
+        # Import baselines from the downloaded DB into local DB
+        if self.db is None:
+            return
+        try:
+            import_start = time.time()
+            count = self.db.import_baseline_from(str(tmp_path))
+            self._log(
+                f"Imported {count} baseline fingerprints in {time.time() - import_start:.3f}s"
+            )
+            print(f"✓ pytest-diff: Imported {count} baseline fingerprints from remote")
+        except Exception as e:
+            print(f"⚠ pytest-diff: Failed to import remote baseline: {e}")
+
+    def _upload_baseline(self):
+        """Upload local baseline DB to remote storage."""
+        import time
+
+        self._init_storage()
+        if self.storage is None:
+            return
+
+        try:
+            upload_start = time.time()
+            self.storage.upload(self.db_path, self.remote_key)
+            self._log(f"Uploaded baseline in {time.time() - upload_start:.3f}s")
+            print(f"✓ pytest-diff: Uploaded baseline to {self.remote_url}{self.remote_key}")
+        except Exception as e:
+            print(f"⚠ pytest-diff: Failed to upload baseline: {e}")
 
     def pytest_configure(self, config):
         """Initialize database and coverage collector"""
@@ -154,6 +238,7 @@ class TestmonPlugin:
             return
 
         import time
+
         start = time.time()
         self._log("Starting pytest_configure")
 
@@ -183,7 +268,9 @@ class TestmonPlugin:
         # Initialize fingerprint cache with configurable size
         cache_start = time.time()
         self.fp_cache = _core.FingerprintCache(self.cache_max_size)
-        self._log(f"Fingerprint cache initialized (max_size={self.cache_max_size}) in {time.time() - cache_start:.3f}s")
+        self._log(
+            f"Fingerprint cache initialized (max_size={self.cache_max_size}) in {time.time() - cache_start:.3f}s"
+        )
 
         # Initialize coverage if available
         coverage_module = None
@@ -206,6 +293,10 @@ class TestmonPlugin:
             self._log(f"Coverage initialized in {time.time() - cov_start:.3f}s")
             if config.option.verbose >= 2:
                 print("[DEBUG] Coverage initialized successfully")
+
+        # Remote baseline: download and import if --diff mode + remote configured
+        if self.remote_url and not self.baseline:
+            self._download_and_import_baseline()
 
         self._log(f"pytest_configure completed in {time.time() - start:.3f}s")
 
@@ -331,14 +422,18 @@ class TestmonPlugin:
                 for filename in measured:
                     filepath = Path(filename)
                     # Basic filtering: only .py files in project
-                    if filepath.suffix == ".py" and str(filepath).startswith(str(self.config.rootdir)):
+                    if filepath.suffix == ".py" and str(filepath).startswith(
+                        str(self.config.rootdir)
+                    ):
                         abs_path = str(filepath.resolve())
                         lines = data.lines(filename)
                         if lines is None:
                             continue
                         executed_lines = list(lines)
                         coverage_map[abs_path] = executed_lines
-                self._log(f"Extracted coverage for {len(coverage_map)} files in {time.time() - extract_start:.3f}s")
+                self._log(
+                    f"Extracted coverage for {len(coverage_map)} files in {time.time() - extract_start:.3f}s"
+                )
 
                 # Let Rust do the heavy lifting in parallel!
                 # This handles:
@@ -354,13 +449,16 @@ class TestmonPlugin:
                         test_file_str,
                         self.config.option.verbose >= 2 or self.verbose,
                         self.scope_paths,
-                        self.fp_cache  # Use cache to avoid re-parsing
+                        self.fp_cache,  # Use cache to avoid re-parsing
                     )
-                    self._log(f"Rust processing took {time.time() - process_start:.3f}s, got {len(fingerprints)} fingerprints")
+                    self._log(
+                        f"Rust processing took {time.time() - process_start:.3f}s, got {len(fingerprints)} fingerprints"
+                    )
                 except Exception as e:
                     if self.config.option.verbose:
                         print(f"\n⚠ pytest-diff: Error processing coverage: {e}")
                         import traceback
+
                         traceback.print_exc()
 
                 erase_start = time.time()
@@ -403,15 +501,20 @@ class TestmonPlugin:
         if self.fp_cache and self.verbose:
             hits, misses, hit_rate = self.fp_cache.stats()
             cache_size = self.fp_cache.size()
-            self._log(f"Fingerprint cache stats: {hits} hits, {misses} misses, {hit_rate*100:.1f}% hit rate, {cache_size} cached files")
+            self._log(
+                f"Fingerprint cache stats: {hits} hits, {misses} misses, {hit_rate*100:.1f}% hit rate, {cache_size} cached files"
+            )
 
         # If baseline mode, save baseline fingerprints
         if self.baseline:
             try:
                 import time
+
                 self._log("Starting baseline save")
                 start = time.time()
-                count = _core.save_baseline(str(self.db_path), str(self.config.rootdir), self.verbose, self.scope_paths)
+                count = _core.save_baseline(
+                    str(self.db_path), str(self.config.rootdir), self.verbose, self.scope_paths
+                )
                 elapsed = time.time() - start
                 self._log(f"Baseline save completed in {elapsed:.3f}s")
                 terminalreporter.write_sep(
@@ -425,6 +528,17 @@ class TestmonPlugin:
                     f"pytest-diff: Failed to save baseline: {e}",
                     red=True,
                 )
+                return
+
+            # Upload baseline if requested
+            if self.upload and self.remote_url:
+                # Close DB first to checkpoint WAL into single file
+                if self.db:
+                    try:
+                        self.db.close()
+                    except Exception:
+                        pass
+                self._upload_baseline()
             return
 
         if self.deselected_items:
@@ -485,6 +599,19 @@ def pytest_addoption(parser):
         help="Maximum fingerprints to cache in memory (default: 100000, increase for very large codebases)",
     )
 
+    group.addoption(
+        "--diff-remote",
+        type=str,
+        default=None,
+        help="Remote storage URL for baseline DB (e.g. s3://bucket/prefix/, file:///path/)",
+    )
+
+    group.addoption(
+        "--diff-upload",
+        action="store_true",
+        help="Upload baseline DB to remote storage after --diff-baseline completes",
+    )
+
     # Register ini options for pyproject.toml configuration
     parser.addini(
         "diff_batch_size",
@@ -497,6 +624,18 @@ def pytest_addoption(parser):
         type="string",
         default="100000",
         help="Maximum fingerprints to cache in memory",
+    )
+    parser.addini(
+        "diff_remote_url",
+        type="string",
+        default="",
+        help="Remote storage URL for baseline DB (e.g. s3://bucket/prefix/, file:///path/)",
+    )
+    parser.addini(
+        "diff_remote_key",
+        type="string",
+        default="baseline.db",
+        help="Remote key/filename for the baseline DB (default: baseline.db)",
     )
 
 
