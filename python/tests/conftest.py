@@ -22,11 +22,7 @@ def sample_project(pytester):
         **{
             "mylib/__init__.py": "",
             "mylib/calculator.py": (
-                "def add(a, b):\n"
-                "    return a + b\n"
-                "\n"
-                "def multiply(a, b):\n"
-                "    return a * b\n"
+                "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n"
             ),
             "tests/__init__.py": "",
             "tests/test_calc.py": (
@@ -59,18 +55,10 @@ def multi_module_project(pytester):
         **{
             "mylib/__init__.py": "",
             "mylib/math_ops.py": (
-                "def add(a, b):\n"
-                "    return a + b\n"
-                "\n"
-                "def subtract(a, b):\n"
-                "    return a - b\n"
+                "def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n"
             ),
             "mylib/string_ops.py": (
-                "def upper(s):\n"
-                "    return s.upper()\n"
-                "\n"
-                "def concat(a, b):\n"
-                "    return a + b\n"
+                "def upper(s):\n    return s.upper()\n\ndef concat(a, b):\n    return a + b\n"
             ),
             "tests/__init__.py": "",
             "tests/test_math.py": (

@@ -36,7 +36,7 @@ class TestmonPlugin:
 
         if _core is None:
             raise ImportError(
-                "pytest-diff Rust core not found. " "Please install with: pip install pytest-diff"
+                "pytest-diff Rust core not found. Please install with: pip install pytest-diff"
             )
 
         # Remote storage configuration
@@ -624,7 +624,7 @@ class TestmonPlugin:
             hits, misses, hit_rate = self.fp_cache.stats()
             cache_size = self.fp_cache.size()
             self._log(
-                f"Fingerprint cache stats: {hits} hits, {misses} misses, {hit_rate*100:.1f}% hit rate, {cache_size} cached files"
+                f"Fingerprint cache stats: {hits} hits, {misses} misses, {hit_rate * 100:.1f}% hit rate, {cache_size} cached files"
             )
 
         # If baseline mode, save baseline fingerprints

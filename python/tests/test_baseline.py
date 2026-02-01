@@ -47,9 +47,9 @@ def test_baseline_revert_scenario():
 
         # Step 6: Verify NO changes detected (back to baseline!)
         changes = _core.detect_changes(str(db_path), str(tmpdir), scope_paths)
-        assert (
-            not changes.has_changes()
-        ), "Should detect NO changes after reverting to baseline - this is the key fix!"
+        assert not changes.has_changes(), (
+            "Should detect NO changes after reverting to baseline - this is the key fix!"
+        )
         assert len(changes.modified) == 0
         assert len(changes.changed_blocks) == 0
 

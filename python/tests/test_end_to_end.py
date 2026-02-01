@@ -37,11 +37,7 @@ def test_revert_after_change_skips_all(baselined_project):
     # Modify
     time.sleep(0.01)
     calc.write_text(
-        "def add(a, b):\n"
-        "    return a + b + 999\n"
-        "\n"
-        "def multiply(a, b):\n"
-        "    return a * b\n"
+        "def add(a, b):\n    return a + b + 999\n\ndef multiply(a, b):\n    return a * b\n"
     )
 
     result = baselined_project.runpytest_subprocess("--diff", "-v")

@@ -4,15 +4,12 @@ Direct tests for the _core Rust module (fingerprint, cache, database).
 These tests use tmp_path (standard pytest) instead of pytester.
 """
 
-
 from pytest_diff import _core
 
 
 def test_parse_module_returns_blocks():
     """parse_module extracts function/class blocks with correct names."""
-    source = (
-        "def foo():\n" "    pass\n" "\n" "class Bar:\n" "    def method(self):\n" "        pass\n"
-    )
+    source = "def foo():\n    pass\n\nclass Bar:\n    def method(self):\n        pass\n"
     blocks = _core.parse_module(source)
     names = [b.name for b in blocks]
     assert "<module>" in names
