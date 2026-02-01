@@ -581,8 +581,8 @@ requires-dist = [
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.26" },
     { name = "coverage", specifier = ">=7.0" },
     { name = "pytest", specifier = ">=7.0" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "ty", marker = "extra == 'dev'" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.14,<0.15" },
+    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.14,<0.1" },
 ]
 provides-extras = ["dev", "s3"]
 

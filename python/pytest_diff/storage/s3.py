@@ -33,7 +33,7 @@ class S3Storage(BaselineStorage):
     def client(self):  # noqa: ANN201
         if self._client is None:
             try:
-                import boto3  # type: ignore[unresolved-import]
+                import boto3
             except ImportError as exc:
                 raise ImportError(
                     "boto3 is required for S3 storage. Install with: pip install pytest-diff[s3]"

@@ -16,9 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras --dev
-      - run: uv run ruff check python/
-      - run: uv run ruff format --check python/
+      - run: uv tool install "ruff>=0.14.14,<0.15"
+      - run: ruff check python/
+      - run: ruff format --check python/
 
   typecheck:
     name: Type check (ty)
@@ -26,8 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras --dev
-      - run: uv run ty check python/
+      - run: uv sync --no-install-project --all-extras --dev
+      - run: uv run --no-project ty check python/
 
   rust-tests:
     name: Rust tests
@@ -51,5 +51,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras --dev
-      - run: uv run maturin develop
+      - run: uv tool install maturin
+      - run: maturin develop --uv
       - run: uv run pytest
