@@ -226,4 +226,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-**Made with ❤️ and 🦀 by Paul Milesi**
+**Made with ❤️**
