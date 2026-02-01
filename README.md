@@ -4,7 +4,7 @@
 
 **Fast test selection for pytest** - Only run tests affected by your changes, powered by Rust 🦀
 
-[![CI](https://github.com/paulmilesi/pytest-diff/workflows/CI/badge.svg)](https://github.com/paulmilesi/pytest-diff/actions)
+[![CI](https://github.com/PaulM5406/pytest-diff/workflows/CI/badge.svg)](https://github.com/paulmilesi/pytest-diff/actions)
 [![PyPI](https://img.shields.io/pypi/v/pytest-diff.svg)](https://pypi.org/project/pytest-diff/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/pytest-diff.svg)](https://pypi.org/project/pytest-diff/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
