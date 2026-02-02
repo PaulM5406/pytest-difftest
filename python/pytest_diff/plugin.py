@@ -315,7 +315,7 @@ class PytestDiffPlugin:
             self._log(
                 f"Imported {count} baseline fingerprints in {time.time() - import_start:.3f}s"
             )
-            print(f"✓ pytest-diff: Imported {count} baseline fingerprints from remote")
+            print(f"✓ pytest-diff: Imported {count} baseline fingerprints from remote into {self.db_path}")
 
             # Check baseline staleness via stored commit SHA
             baseline_commit = self.db.get_metadata("baseline_commit")
@@ -363,7 +363,8 @@ class PytestDiffPlugin:
             db_start = time.time()
             self.db = _core.PytestDiffDatabase(str(self.db_path))
             self._log(f"Database opened in {time.time() - db_start:.3f}s")
-            print(f"✓ pytest-diff: Using database at {self.db_path}")
+            if not (self.remote_url and not self.baseline):
+                print(f"✓ pytest-diff: Using database at {self.db_path}")
         except Exception as e:
             print(f"⚠ pytest-diff: Could not open database: {e}")
             # Try to delete corrupted database and create fresh
