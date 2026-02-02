@@ -677,7 +677,8 @@ class PytestDiffPlugin:
                 import time
 
                 self._log("Starting baseline save")
-                print("pytest-diff: Saving baseline fingerprints...", flush=True)
+                upload_msg = f" (will upload to {self.remote_url})" if self.upload and self.remote_url else ""
+                print(f"pytest-diff: Saving baseline fingerprints...{upload_msg}", flush=True)
                 start = time.time()
                 count = _core.save_baseline(
                     str(self.db_path), str(self.config.rootdir), self.verbose, self.scope_paths
