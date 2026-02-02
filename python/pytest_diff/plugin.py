@@ -315,7 +315,9 @@ class PytestDiffPlugin:
             self._log(
                 f"Imported {count} baseline fingerprints in {time.time() - import_start:.3f}s"
             )
-            print(f"✓ pytest-diff: Imported {count} baseline fingerprints from remote into {self.db_path}")
+            print(
+                f"✓ pytest-diff: Imported {count} baseline fingerprints from remote into {self.db_path}"
+            )
 
             # Check baseline staleness via stored commit SHA
             baseline_commit = self.db.get_metadata("baseline_commit")
@@ -678,7 +680,11 @@ class PytestDiffPlugin:
                 import time
 
                 self._log("Starting baseline save")
-                upload_msg = f" (will upload to {self.remote_url})" if self.upload and self.remote_url else ""
+                upload_msg = (
+                    f" (will upload to {self.remote_url})"
+                    if self.upload and self.remote_url
+                    else ""
+                )
                 print(f"pytest-diff: Saving baseline fingerprints...{upload_msg}", flush=True)
                 start = time.time()
                 count = _core.save_baseline(
