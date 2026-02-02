@@ -90,6 +90,41 @@ def test_diff_keeps_selecting_affected_tests_until_rebaseline(baselined_project)
     result.assert_outcomes()
 
 
+def test_new_test_file_is_selected(baselined_project):
+    """A new test file added after baseline should be selected by --diff."""
+    # Add a new test file
+    new_test = baselined_project.path / "tests" / "test_new.py"
+    new_test.write_text("def test_brand_new():\n    assert 1 + 1 == 2\n")
+
+    result = baselined_project.runpytest_subprocess("--diff", "-v")
+    result.stdout.fnmatch_lines(["*modified*"])
+    # The new test should be selected and pass
+    result.assert_outcomes(passed=1)
+
+
+def test_new_source_file_runs_dependent_tests(baselined_project):
+    """A new source file added after baseline should trigger tests that import it."""
+    # Add a new source module
+    new_module = baselined_project.path / "mylib" / "helpers.py"
+    new_module.write_text("def greet(name):\n    return f'Hello {name}'\n")
+
+    # Add a test that imports the new module
+    new_test = baselined_project.path / "tests" / "test_helpers.py"
+    new_test.write_text(
+        "import sys\n"
+        "sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))\n"
+        "from mylib.helpers import greet\n"
+        "\n"
+        "def test_greet():\n"
+        "    assert greet('world') == 'Hello world'\n"
+    )
+
+    result = baselined_project.runpytest_subprocess("--diff", "-v")
+    result.stdout.fnmatch_lines(["*modified*"])
+    # Both new files detected; the new test should run
+    result.assert_outcomes(passed=1)
+
+
 def test_multiple_diff_runs_stable(baselined_project):
     """Running --diff 3x without changes always skips all."""
     for _ in range(3):

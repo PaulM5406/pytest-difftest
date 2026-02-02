@@ -371,8 +371,11 @@ fn check_file_changed_with_baseline(
     let stored_fp = match baselines.get(&filename) {
         Some(fp) => fp,
         None => {
-            // No baseline for this file - not tracked yet
-            return Ok(None);
+            // No baseline for this file - it's new, treat as changed
+            // Parse to get checksums so new tests in this file can be selected
+            let current_fp = calculate_fingerprint(path.to_string_lossy().as_ref())?;
+            let checksums = current_fp.checksums.clone();
+            return Ok(Some((filename, checksums)));
         }
     };
 

@@ -85,3 +85,48 @@ diff_batch_size = 999
     )
     result.assert_outcomes(passed=1)
     result.stdout.fnmatch_lines(["*Flushed 1 test executions*"])
+
+
+def test_diff_and_baseline_warning(pytester):
+    """Using --diff and --diff-baseline together warns that --diff-baseline takes precedence."""
+    pytester.makepyfile("def test_noop(): pass")
+    result = pytester.runpytest_subprocess("--diff", "--diff-baseline", "-v")
+    result.stdout.fnmatch_lines(["*--diff-baseline takes precedence*"])
+    result.stdout.fnmatch_lines(["*Baseline saved*"])
+
+
+def test_scope_mismatch_baseline_runs_all_tests(sample_project):
+    """When --diff-baseline scope differs from previous baseline, all tests run."""
+    # Build baseline scoped to "tests/" subdirectory
+    result = sample_project.runpytest_subprocess("--diff-baseline", "tests/", "-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*Baseline saved*"])
+
+    # Re-run --diff-baseline without scope restriction — scope mismatch, runs all
+    result = sample_project.runpytest_subprocess("--diff-baseline", "-v")
+    result.stdout.fnmatch_lines(["*Scope mismatch*Running all tests to rebuild baseline*"])
+    result.assert_outcomes(passed=2)
+
+
+def test_scope_mismatch_diff_warns_only(sample_project):
+    """When --diff scope differs from baseline, warn but still select tests normally."""
+    # Build baseline scoped to "tests/" subdirectory
+    result = sample_project.runpytest_subprocess("--diff-baseline", "tests/", "-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*Baseline saved*"])
+
+    # Run --diff without scope restriction — warns but doesn't force all tests
+    result = sample_project.runpytest_subprocess("--diff", "-v")
+    result.stdout.fnmatch_lines(["*Scope mismatch*Some tests may not be selected*"])
+
+
+def test_subscope_no_warning(sample_project):
+    """When --diff scope is a subset of baseline scope, no warning is shown."""
+    # Build baseline at rootdir (broad scope)
+    result = sample_project.runpytest_subprocess("--diff-baseline", "-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*Baseline saved*"])
+
+    # Run --diff scoped to tests/ (narrower) — no mismatch, baseline covers it
+    result = sample_project.runpytest_subprocess("--diff", "tests/", "-v")
+    result.stdout.no_fnmatch_line("*Scope mismatch*")

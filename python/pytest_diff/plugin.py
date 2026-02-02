@@ -228,28 +228,80 @@ class PytestDiffPlugin:
             f"Consider re-running: pytest --diff-baseline"
         )
 
-    def _check_scope_mismatch(self):
-        """Warn if the current diff scope differs from the baseline scope."""
+    @staticmethod
+    def _is_subpath(child: Path, parent: Path) -> bool:
+        """Check if child is equal to or a subdirectory of parent."""
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _relative_scope_paths(scope_paths: list[str], rootdir: str) -> list[str]:
+        """Convert absolute scope paths to relative paths from rootdir.
+
+        Paths equal to rootdir become '.'.
+        """
+        result = []
+        for p in scope_paths:
+            try:
+                result.append(str(Path(p).relative_to(rootdir)))
+            except ValueError:
+                result.append(p)
+        return result
+
+    def _check_scope_mismatch(self) -> bool:
+        """Check if the current diff scope differs from the baseline scope.
+
+        Returns True if there is a mismatch.
+        In --diff-baseline mode the caller should run all tests to rebuild properly.
+        In --diff mode this is informational only.
+        """
         if self.db is None:
-            return
+            return False
         import json
 
         raw = self.db.get_metadata("baseline_scope")
         if raw is None:
-            return
+            return False
         try:
             baseline_scope = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            return
-        if sorted(baseline_scope) != sorted(self.scope_paths):
-            baseline_display = ", ".join(baseline_scope) or "<rootdir>"
-            current_display = ", ".join(self.scope_paths) or "<rootdir>"
+            return False
+
+        rootdir = str(self.config.rootdir)
+        current_scope = self._relative_scope_paths(self.scope_paths, rootdir)
+
+        if sorted(baseline_scope) == sorted(current_scope):
+            return False
+
+        # Check if current scope is a subset of baseline scope
+        # (e.g. baseline=tests/, current=tests/unit/) — baseline covers everything
+        baseline_paths = [Path(p) for p in baseline_scope]
+        current_paths = [Path(p) for p in current_scope]
+        is_subscope = all(
+            any(self._is_subpath(cp, bp) for bp in baseline_paths) for cp in current_paths
+        )
+        if is_subscope:
+            return False
+
+        baseline_display = ", ".join(baseline_scope) or "."
+        current_display = ", ".join(current_scope) or "."
+        if self.baseline:
+            print(
+                f"⚠ pytest-diff: Scope mismatch — baseline was built with [{baseline_display}] "
+                f"but current run uses [{current_display}]. "
+                f"Running all tests to rebuild baseline."
+            )
+        else:
             print(
                 f"⚠ pytest-diff: Scope mismatch — baseline was built with [{baseline_display}] "
                 f"but current run uses [{current_display}]. "
                 f"Some tests may not be selected. "
                 f"Consider re-running: pytest --diff-baseline {current_display}"
             )
+        return True
 
     def _flush_test_batch(self):
         """Flush batched test executions to database"""
@@ -425,6 +477,10 @@ class PytestDiffPlugin:
             return
 
         if self.baseline and not self.force:
+            # Scope mismatch in baseline mode: run all tests to rebuild properly
+            if self._check_scope_mismatch():
+                return
+
             # Incremental baseline: if DB already has test data, only run affected tests
             assert self.db is not None
             stats = self.db.get_stats()
@@ -482,7 +538,13 @@ class PytestDiffPlugin:
 
                 # Get affected tests from database
                 assert self.db is not None
-                affected_tests = self.db.get_affected_tests(changed.changed_blocks)
+                affected_tests = set(self.db.get_affected_tests(changed.changed_blocks))
+
+                # Also select tests living in modified files (new test files)
+                modified_abs = {str(Path(f).resolve()) for f in changed.modified}
+                for item in items:
+                    if str(Path(item.fspath).resolve()) in modified_abs:
+                        affected_tests.add(item.nodeid)
 
                 if affected_tests:
                     # Select only affected tests
@@ -705,11 +767,13 @@ class PytestDiffPlugin:
                     self.db.set_metadata("baseline_commit", sha)
                     self._log(f"Stored baseline commit SHA: {sha[:10]}")
 
-                # Store scope paths so diff runs can detect mismatches
+                # Store scope paths (relative to rootdir) so diff runs can detect mismatches
                 if self.db:
                     import json
 
-                    self.db.set_metadata("baseline_scope", json.dumps(self.scope_paths))
+                    rootdir = str(self.config.rootdir)
+                    relative_scopes = self._relative_scope_paths(self.scope_paths, rootdir)
+                    self.db.set_metadata("baseline_scope", json.dumps(relative_scopes))
             except Exception as e:
                 terminalreporter.write_sep(
                     "=",

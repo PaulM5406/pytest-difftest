@@ -76,7 +76,7 @@ def test_database_stats_empty(tmp_path):
 
 
 def test_detect_changes_no_baseline(tmp_path):
-    """No baseline means no changes detected."""
+    """Files with no baseline are detected as new/changed."""
     db_path = tmp_path / "test.db"
     # Create the DB so detect_changes doesn't fail on missing file
     _core.PytestDiffDatabase(str(db_path))
@@ -85,5 +85,6 @@ def test_detect_changes_no_baseline(tmp_path):
     f.write_text("def foo(): pass\n")
 
     changes = _core.detect_changes(str(db_path), str(tmp_path), [str(tmp_path)])
-    # With no baseline saved, detect_changes should report no changes
-    assert not changes.has_changes()
+    # New files (no baseline) should be detected as changed
+    assert changes.has_changes()
+    assert len(changes.modified) == 1
