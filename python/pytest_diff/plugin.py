@@ -26,7 +26,13 @@ class PytestDiffPlugin:
         self.config = config
         self.baseline = config.getoption("--diff-baseline", False)
         self.force = config.getoption("--diff-force", False)
-        self.enabled = config.getoption("--diff", False) or self.baseline
+        diff_flag = config.getoption("--diff", False)
+        self.enabled = diff_flag or self.baseline
+        if self.baseline and diff_flag:
+            print(
+                "⚠ pytest-diff: Both --diff and --diff-baseline provided;"
+                " --diff-baseline takes precedence (--diff will be ignored)"
+            )
         self.verbose = config.getoption("--diff-v", False)
         self.upload = config.getoption("--diff-upload", False)
 
@@ -89,6 +95,15 @@ class PytestDiffPlugin:
 
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] pytest-diff: {message}")
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """Format a byte count as a human-readable string."""
+        for unit in ("B", "KB", "MB", "GB"):
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} TB"
 
     @staticmethod
     def _get_config_value(config, cli_name: str, ini_name: str, default: int) -> int:
@@ -211,6 +226,29 @@ class PytestDiffPlugin:
             f"Test selection may be unreliable. "
             f"Consider re-running: pytest --diff-baseline"
         )
+
+    def _check_scope_mismatch(self):
+        """Warn if the current diff scope differs from the baseline scope."""
+        if self.db is None:
+            return
+        import json
+
+        raw = self.db.get_metadata("baseline_scope")
+        if raw is None:
+            return
+        try:
+            baseline_scope = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if sorted(baseline_scope) != sorted(self.scope_paths):
+            baseline_display = ", ".join(baseline_scope) or "<rootdir>"
+            current_display = ", ".join(self.scope_paths) or "<rootdir>"
+            print(
+                f"⚠ pytest-diff: Scope mismatch — baseline was built with [{baseline_display}] "
+                f"but current run uses [{current_display}]. "
+                f"Some tests may not be selected. "
+                f"Consider re-running: pytest --diff-baseline {current_display}"
+            )
 
     def _flush_test_batch(self):
         """Flush batched test executions to database"""
@@ -427,6 +465,9 @@ class PytestDiffPlugin:
             # First baseline or --diff-force: run all tests
             return
 
+        # Warn if diff scope differs from baseline scope
+        self._check_scope_mismatch()
+
         try:
             # Detect changes
             changed = _core.detect_changes(str(self.db_path), str(config.rootdir), self.scope_paths)
@@ -642,9 +683,10 @@ class PytestDiffPlugin:
                 )
                 elapsed = time.time() - start
                 self._log(f"Baseline save completed in {elapsed:.3f}s")
+                db_size = self._format_size(self.db_path.stat().st_size)
                 terminalreporter.write_sep(
                     "=",
-                    f"pytest-diff: Baseline saved for {count} files in {elapsed:.1f}s",
+                    f"pytest-diff: Baseline saved for {count} files in {elapsed:.1f}s ({db_size})",
                     green=True,
                 )
 
@@ -653,6 +695,12 @@ class PytestDiffPlugin:
                 if sha and self.db:
                     self.db.set_metadata("baseline_commit", sha)
                     self._log(f"Stored baseline commit SHA: {sha[:10]}")
+
+                # Store scope paths so diff runs can detect mismatches
+                if self.db:
+                    import json
+
+                    self.db.set_metadata("baseline_scope", json.dumps(self.scope_paths))
             except Exception as e:
                 terminalreporter.write_sep(
                     "=",
