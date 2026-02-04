@@ -35,6 +35,11 @@ def init_storage(
     return storage
 
 
+def _is_prefix_key(remote_key: str) -> bool:
+    """Check if remote_key indicates a prefix (directory) rather than a single file."""
+    return not remote_key or remote_key.endswith("/")
+
+
 def download_and_import_baseline(
     storage: Any,
     remote_url: str | None,
@@ -46,6 +51,9 @@ def download_and_import_baseline(
 ) -> Any:
     """Download remote baseline DB and import via ATTACH.
 
+    If remote_key is empty or ends with '/', treats it as a prefix and downloads
+    all .db files, merging them into the local database.
+
     *log* is a ``logging.Logger`` instance.
 
     Returns the (possibly newly created) storage object.
@@ -54,6 +62,23 @@ def download_and_import_baseline(
     if storage is None:
         return storage
 
+    # Handle prefix-based download (multiple databases)
+    if _is_prefix_key(remote_key):
+        return _download_and_merge_baselines(storage, remote_key, db, db_path, rootdir, log)
+
+    # Single file download (existing behavior)
+    return _download_single_baseline(storage, remote_key, db, db_path, rootdir, log)
+
+
+def _download_single_baseline(
+    storage: Any,
+    remote_key: str,
+    db: Any,
+    db_path: Path,
+    rootdir: str,
+    log: Any,
+) -> Any:
+    """Download a single baseline file and import it."""
     dl_start = time.time()
     # Use NamedTemporaryFile for unique filename (avoids race conditions with xdist)
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
@@ -87,15 +112,7 @@ def download_and_import_baseline(
                 db_path,
             )
 
-            baseline_commit = db.get_metadata("baseline_commit")
-            if baseline_commit:
-                from pytest_diff._git import check_baseline_staleness
-
-                warning = check_baseline_staleness(baseline_commit, rootdir)
-                if warning:
-                    logger.warning("⚠ pytest-diff: %s", warning)
-            else:
-                log.debug("No baseline_commit metadata found — skipping staleness check")
+            _check_baseline_staleness(db, rootdir, log)
         except Exception as e:
             logger.warning("⚠ pytest-diff: Failed to import remote baseline: %s", e)
     finally:
@@ -103,6 +120,110 @@ def download_and_import_baseline(
         tmp_path.unlink(missing_ok=True)
 
     return storage
+
+
+def _download_and_merge_baselines(
+    storage: Any,
+    prefix: str,
+    db: Any,
+    db_path: Path,
+    rootdir: str,
+    log: Any,
+) -> Any:
+    """Download all baseline files from a prefix and merge them."""
+    dl_start = time.time()
+
+    # Create temp directory for downloaded files
+    temp_dir = Path(tempfile.mkdtemp(prefix="pytest_diff_"))
+
+    try:
+        try:
+            downloaded_files = storage.download_all(temp_dir, prefix.rstrip("/"))
+        except Exception as e:
+            logger.warning("⚠ pytest-diff: Failed to download baselines from prefix: %s", e)
+            return storage
+
+        if not downloaded_files:
+            log.debug("No baseline files found at remote prefix — skipping import")
+            return storage
+
+        log.debug(
+            "Downloaded %d baseline files in %.3fs", len(downloaded_files), time.time() - dl_start
+        )
+
+        if db is None:
+            return storage
+
+        # Check for commit mismatches before merging
+        _check_commit_consistency(db, downloaded_files, log)
+
+        # Merge all downloaded databases
+        total_count = 0
+        merge_start = time.time()
+        for db_file in downloaded_files:
+            try:
+                count = db.merge_baseline_from(str(db_file))
+                log.debug("Merged %d baselines from %s", count, db_file.name)
+                total_count += count
+            except Exception as e:
+                logger.warning("⚠ pytest-diff: Failed to merge baseline from %s: %s", db_file, e)
+
+        log.debug("Merged %d total baselines in %.3fs", total_count, time.time() - merge_start)
+        logger.info(
+            "✓ pytest-diff: Merged %d baseline fingerprints from %d files into %s",
+            total_count,
+            len(downloaded_files),
+            db_path,
+        )
+
+        _check_baseline_staleness(db, rootdir, log)
+
+    finally:
+        # Clean up temp directory
+        import shutil
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return storage
+
+
+def _check_commit_consistency(db: Any, db_files: list[Path], log: Any) -> None:
+    """Check that all databases being merged have the same baseline_commit.
+
+    Warns if databases have different commits, which could indicate
+    they were generated from different CI runs.
+    """
+    commits: dict[str, list[str]] = {}  # commit -> list of filenames
+
+    for db_file in db_files:
+        try:
+            commit = db.get_external_metadata(str(db_file), "baseline_commit")
+            if commit:
+                commits.setdefault(commit, []).append(db_file.name)
+        except Exception as e:
+            log.debug("Could not read baseline_commit from %s: %s", db_file.name, e)
+
+    if len(commits) > 1:
+        # Multiple different commits found
+        details = ", ".join(f"{sha[:8]}({len(files)} files)" for sha, files in commits.items())
+        logger.warning(
+            "⚠ pytest-diff: Merging baselines from different commits: %s. "
+            "This may cause inconsistent test selection.",
+            details,
+        )
+
+
+def _check_baseline_staleness(db: Any, rootdir: str, log: Any) -> None:
+    """Check if the baseline is stale compared to git history."""
+    baseline_commit = db.get_metadata("baseline_commit")
+    if baseline_commit:
+        from pytest_diff._git import check_baseline_staleness
+
+        warning = check_baseline_staleness(baseline_commit, rootdir)
+        if warning:
+            logger.warning("⚠ pytest-diff: %s", warning)
+    else:
+        log.debug("No baseline_commit metadata found — skipping staleness check")
 
 
 def upload_baseline(

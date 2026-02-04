@@ -159,6 +159,32 @@ pytest-diff supports storing the baseline database in remote storage, enabling a
 
 S3 uses ETag-based caching to avoid re-downloading unchanged baselines. All remote errors are non-fatal -- if the download fails, tests run normally using the local baseline.
 
+**Merging baselines from parallel CI jobs:**
+
+When running tests in parallel across multiple CI jobs (e.g., pytest-xdist workers or matrix builds), each job can upload its baseline independently. Use a prefix-based URL to merge them:
+
+```bash
+# CI jobs upload to unique paths
+aws s3 cp pytest_diff.db s3://bucket/pytest-diff/baselines/job-1.db
+aws s3 cp pytest_diff.db s3://bucket/pytest-diff/baselines/job-2.db
+
+# Developers fetch from the prefix (merges all databases)
+pytest --diff --diff-remote "s3://bucket/pytest-diff/baselines/"
+```
+
+When the remote URL ends with `/`, pytest-diff downloads all `.db` files from that prefix and merges them into a single local baseline.
+
+### CLI Commands
+
+pytest-diff provides a CLI for offline database operations:
+
+```bash
+# Merge multiple databases into one
+pytest-diff merge output.db input1.db input2.db input3.db
+```
+
+This is useful for consolidating baselines from parallel CI jobs outside of the test run.
+
 ## Development Setup
 
 pytest-diff uses modern Python tooling:

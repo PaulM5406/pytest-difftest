@@ -87,3 +87,47 @@ class S3Storage(BaselineStorage):
             etag_path.write_text(new_etag)
 
         return True
+
+    def list_baselines(self, prefix: str = "") -> list[str]:
+        """List all .db files under a prefix.
+
+        Args:
+            prefix: Additional prefix to append to the storage prefix.
+
+        Returns:
+            List of S3 keys (full paths) for all .db files found.
+        """
+        full_prefix = f"{self.prefix}{prefix}"
+        keys: list[str] = []
+
+        # Use paginator to handle >1000 objects
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".db"):
+                    keys.append(key)
+
+        return keys
+
+    def download_all(self, local_dir: Path, prefix: str = "") -> list[Path]:
+        """Download all .db files from the configured prefix to local_dir.
+
+        Args:
+            local_dir: Local directory to download files to.
+            prefix: Additional prefix to append to the storage prefix.
+
+        Returns:
+            List of local file paths that were downloaded.
+        """
+        keys = self.list_baselines(prefix)
+        downloaded: list[Path] = []
+
+        for key in keys:
+            # Use the filename from the key
+            filename = Path(key).name
+            local_path = local_dir / filename
+            self.client.download_file(self.bucket, key, str(local_path))
+            downloaded.append(local_path)
+
+        return downloaded

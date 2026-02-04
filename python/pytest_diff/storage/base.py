@@ -25,3 +25,19 @@ class BaselineStorage(ABC):
 
         Raises on failure (other than cache-hit).
         """
+
+    def list_baselines(self, prefix: str = "") -> list[str]:
+        """List all .db files under a prefix.
+
+        Override in subclasses that support prefix listing.
+        Default implementation returns empty list.
+        """
+        return []
+
+    def download_all(self, local_dir: Path, prefix: str = "") -> list[Path]:
+        """Download all .db files from the configured prefix to local_dir.
+
+        Override in subclasses that support bulk downloads.
+        Default implementation returns empty list.
+        """
+        return []

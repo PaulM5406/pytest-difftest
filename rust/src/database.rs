@@ -383,6 +383,35 @@ impl PytestDiffDatabase {
             })
     }
 
+    /// Merge baseline fingerprints from another database file using ATTACH DATABASE.
+    ///
+    /// Unlike `import_baseline_from`, this does NOT clear existing baselines first.
+    /// Uses INSERT OR REPLACE to accumulate baselines from multiple sources,
+    /// allowing incremental merging of databases from parallel CI jobs.
+    /// Returns the number of merged records.
+    fn merge_baseline_from(&mut self, source_db_path: &str) -> PyResult<usize> {
+        self.merge_baseline_from_internal(source_db_path)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to merge baseline: {}",
+                    e
+                ))
+            })
+    }
+
+    /// Read a metadata value from an external database file without importing it.
+    ///
+    /// Useful for checking metadata (e.g., baseline_commit) before merging.
+    fn get_external_metadata(&self, source_db_path: &str, key: &str) -> PyResult<Option<String>> {
+        self.get_external_metadata_internal(source_db_path, key)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to get external metadata: {}",
+                    e
+                ))
+            })
+    }
+
     /// Store a metadata key-value pair (INSERT OR REPLACE)
     fn set_metadata(&self, key: &str, value: &str) -> PyResult<()> {
         self.set_metadata_internal(key, value).map_err(|e| {
@@ -693,6 +722,80 @@ impl PytestDiffDatabase {
         result
     }
 
+    fn merge_baseline_from_internal(&mut self, source_db_path: &str) -> Result<usize> {
+        // Verify source file exists
+        if !Path::new(source_db_path).exists() {
+            anyhow::bail!("Source database does not exist: {}", source_db_path);
+        }
+
+        let conn = self.conn.write();
+
+        // Attach the source database
+        conn.execute("ATTACH DATABASE ?1 AS source_db", params![source_db_path])
+            .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
+
+        // Merge baselines using INSERT OR REPLACE (does NOT clear existing baselines)
+        let result = (|| -> Result<usize> {
+            let count = conn
+                .execute(
+                    "INSERT OR REPLACE INTO baseline_fp (filename, method_checksums, mtime, fsha, created_at)
+                     SELECT filename, method_checksums, mtime, fsha, created_at
+                     FROM source_db.baseline_fp",
+                    [],
+                )
+                .context("Failed to merge baselines from source")?;
+
+            // Also merge metadata rows from source (e.g. baseline_commit SHA)
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (dataid, data)
+                 SELECT dataid, data FROM source_db.metadata",
+                [],
+            )
+            .context("Failed to merge metadata from source")?;
+
+            Ok(count)
+        })();
+
+        // Always detach, even if the merge failed
+        conn.execute("DETACH DATABASE source_db", [])
+            .context("Failed to detach source database")?;
+
+        result
+    }
+
+    fn get_external_metadata_internal(
+        &self,
+        source_db_path: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        // Verify source file exists
+        if !Path::new(source_db_path).exists() {
+            anyhow::bail!("Source database does not exist: {}", source_db_path);
+        }
+
+        // ATTACH requires a write lock
+        let conn = self.conn.write();
+
+        // Attach the source database
+        conn.execute("ATTACH DATABASE ?1 AS source_db", params![source_db_path])
+            .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
+
+        let result = conn
+            .query_row(
+                "SELECT data FROM source_db.metadata WHERE dataid = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query external metadata");
+
+        // Always detach
+        conn.execute("DETACH DATABASE source_db", [])
+            .context("Failed to detach source database")?;
+
+        result
+    }
+
     fn set_metadata_internal(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.write();
         conn.execute(
@@ -975,6 +1078,138 @@ mod tests {
             target_db.get_metadata_internal("baseline_commit").unwrap(),
             Some("source_sha_123".to_string())
         );
+    }
+
+    #[test]
+    fn test_merge_baseline_from() {
+        // Create first source database with some baselines
+        let source1_file = NamedTempFile::new().unwrap();
+        let mut source1_db =
+            PytestDiffDatabase::new_internal(source1_file.path().to_str().unwrap()).unwrap();
+
+        let fp1 = Fingerprint {
+            filename: "src/foo.py".to_string(),
+            checksums: vec![10, 20, 30],
+            file_hash: "hash_foo".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+        source1_db.save_baseline_fingerprint_internal(fp1).unwrap();
+        source1_db.close_and_checkpoint().unwrap();
+
+        // Create second source database with different baselines
+        let source2_file = NamedTempFile::new().unwrap();
+        let mut source2_db =
+            PytestDiffDatabase::new_internal(source2_file.path().to_str().unwrap()).unwrap();
+
+        let fp2 = Fingerprint {
+            filename: "src/bar.py".to_string(),
+            checksums: vec![40, 50],
+            file_hash: "hash_bar".to_string(),
+            mtime: 2.0,
+            blocks: None,
+        };
+        source2_db.save_baseline_fingerprint_internal(fp2).unwrap();
+        source2_db.close_and_checkpoint().unwrap();
+
+        // Create target database and merge both sources
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        // Verify target has no baselines
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 0);
+
+        // Merge first source
+        let count1 = target_db
+            .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(count1, 1);
+
+        // Verify first merge
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 1);
+
+        // Merge second source (should accumulate, not replace)
+        let count2 = target_db
+            .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(count2, 1);
+
+        // Verify both baselines exist
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 2);
+
+        // Verify both fingerprints are accessible
+        let imported_fp1 = target_db
+            .get_baseline_fingerprint_internal("src/foo.py")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_fp1.checksums, vec![10, 20, 30]);
+
+        let imported_fp2 = target_db
+            .get_baseline_fingerprint_internal("src/bar.py")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_fp2.checksums, vec![40, 50]);
+    }
+
+    #[test]
+    fn test_merge_baseline_from_replaces_same_file() {
+        // Test that merging a database with the same file replaces it
+        let source1_file = NamedTempFile::new().unwrap();
+        let mut source1_db =
+            PytestDiffDatabase::new_internal(source1_file.path().to_str().unwrap()).unwrap();
+
+        let fp1 = Fingerprint {
+            filename: "src/foo.py".to_string(),
+            checksums: vec![10, 20],
+            file_hash: "hash_old".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+        source1_db.save_baseline_fingerprint_internal(fp1).unwrap();
+        source1_db.close_and_checkpoint().unwrap();
+
+        // Create second source with same filename but different content
+        let source2_file = NamedTempFile::new().unwrap();
+        let mut source2_db =
+            PytestDiffDatabase::new_internal(source2_file.path().to_str().unwrap()).unwrap();
+
+        let fp2 = Fingerprint {
+            filename: "src/foo.py".to_string(),
+            checksums: vec![30, 40, 50],
+            file_hash: "hash_new".to_string(),
+            mtime: 2.0,
+            blocks: None,
+        };
+        source2_db.save_baseline_fingerprint_internal(fp2).unwrap();
+        source2_db.close_and_checkpoint().unwrap();
+
+        // Merge both into target
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        target_db
+            .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
+            .unwrap();
+        target_db
+            .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
+            .unwrap();
+
+        // Should still have 1 baseline (replaced)
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 1);
+
+        // The newer version should win
+        let imported_fp = target_db
+            .get_baseline_fingerprint_internal("src/foo.py")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_fp.checksums, vec![30, 40, 50]);
+        assert_eq!(imported_fp.file_hash, "hash_new");
     }
 
     #[test]

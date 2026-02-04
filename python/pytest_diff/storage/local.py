@@ -42,3 +42,24 @@ class LocalStorage(BaselineStorage):
         local_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, local_path)
         return True
+
+    def list_baselines(self, prefix: str = "") -> list[str]:
+        """List all .db files under a prefix."""
+        search_path = self.root / prefix if prefix else self.root
+        if not search_path.exists():
+            return []
+        return [str(p.relative_to(self.root)) for p in search_path.glob("**/*.db")]
+
+    def download_all(self, local_dir: Path, prefix: str = "") -> list[Path]:
+        """Download all .db files from the configured prefix to local_dir."""
+        keys = self.list_baselines(prefix)
+        downloaded: list[Path] = []
+
+        for key in keys:
+            src = self.root / key
+            filename = Path(key).name
+            local_path = local_dir / filename
+            shutil.copy2(src, local_path)
+            downloaded.append(local_path)
+
+        return downloaded

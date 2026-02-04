@@ -49,6 +49,9 @@ Homepage = "https://github.com/paulmilesi/pytest-diff"
 Repository = "https://github.com/paulmilesi/pytest-diff"
 Issues = "https://github.com/paulmilesi/pytest-diff/issues"
 
+[project.scripts]
+pytest-diff = "pytest_diff.cli:main"
+
 [project.entry-points.pytest11]
 diff = "pytest_diff.plugin"
 
