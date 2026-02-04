@@ -24,9 +24,7 @@ class TestXdistHelpers:
 
         result = is_xdist_controller(pytestconfig)
         # Controller has workercount but not workerinput
-        expected = hasattr(pytestconfig, "workercount") and not hasattr(
-            pytestconfig, "workerinput"
-        )
+        expected = hasattr(pytestconfig, "workercount") and not hasattr(pytestconfig, "workerinput")
         assert result is expected
 
     def test_get_worker_id(self, pytestconfig):
