@@ -19,6 +19,7 @@ pytest-diff is a pytest plugin that intelligently selects and runs only the test
 - 🔍 **Block-level granularity** - Tracks changes at function/class level, not just files
 - 🔧 **pytest-xdist compatible** - Works with parallel test execution
 - 💾 **SQLite storage** - Reliable, portable test dependency database
+- 🚀 **Upload/Download baseline to S3** - Easily share baseline of tests across a team
 
 ## Installation
 
