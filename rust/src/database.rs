@@ -21,6 +21,16 @@ use crate::types::Fingerprint;
 /// Default busy timeout in milliseconds for concurrent access
 const BUSY_TIMEOUT_MS: i32 = 30_000; // 30 seconds
 
+/// Result of an import or merge operation
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct ImportResult {
+    #[pyo3(get)]
+    pub baseline_count: usize,
+    #[pyo3(get)]
+    pub test_execution_count: usize,
+}
+
 /// Main database interface for pytest-diff
 ///
 /// Manages the pytest-diff SQLite database with optimizations:
@@ -369,11 +379,12 @@ impl PytestDiffDatabase {
         Ok(())
     }
 
-    /// Import baseline fingerprints from another database file using ATTACH DATABASE.
+    /// Import baseline and test execution data from another database file using ATTACH DATABASE.
     ///
-    /// Bulk-copies all `baseline_fp` rows from `source_db_path` into the local database,
-    /// replacing any existing baselines. Returns the number of imported records.
-    fn import_baseline_from(&mut self, source_db_path: &str) -> PyResult<usize> {
+    /// Bulk-copies `baseline_fp`, `environment`, `file_fp`, `test_execution`, and
+    /// `test_execution_file_fp` rows from `source_db_path` into the local database,
+    /// replacing any existing data. Returns an `ImportResult` with counts.
+    fn import_baseline_from(&mut self, source_db_path: &str) -> PyResult<ImportResult> {
         self.import_baseline_from_internal(source_db_path)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -383,13 +394,13 @@ impl PytestDiffDatabase {
             })
     }
 
-    /// Merge baseline fingerprints from another database file using ATTACH DATABASE.
+    /// Merge baseline and test execution data from another database file using ATTACH DATABASE.
     ///
     /// Unlike `import_baseline_from`, this does NOT clear existing baselines first.
     /// Uses INSERT OR REPLACE to accumulate baselines from multiple sources,
     /// allowing incremental merging of databases from parallel CI jobs.
-    /// Returns the number of merged records.
-    fn merge_baseline_from(&mut self, source_db_path: &str) -> PyResult<usize> {
+    /// Returns an `ImportResult` with counts.
+    fn merge_baseline_from(&mut self, source_db_path: &str) -> PyResult<ImportResult> {
         self.merge_baseline_from_internal(source_db_path)
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -678,7 +689,21 @@ impl PytestDiffDatabase {
         Ok(count)
     }
 
-    fn import_baseline_from_internal(&mut self, source_db_path: &str) -> Result<usize> {
+    /// Check if a table exists in the attached source database.
+    /// Used for backward compatibility with older databases that may not have
+    /// test execution tables.
+    fn source_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_db.sqlite_master WHERE type='table' AND name=?1",
+                params![table_name],
+                |row| row.get(0),
+            )
+            .context("Failed to check source table existence")?;
+        Ok(count > 0)
+    }
+
+    fn import_baseline_from_internal(&mut self, source_db_path: &str) -> Result<ImportResult> {
         // Verify source file exists
         if !Path::new(source_db_path).exists() {
             anyhow::bail!("Source database does not exist: {}", source_db_path);
@@ -690,12 +715,12 @@ impl PytestDiffDatabase {
         conn.execute("ATTACH DATABASE ?1 AS source_db", params![source_db_path])
             .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
 
-        // Clear existing baselines and bulk-copy from source, plus metadata
-        let result = (|| -> Result<usize> {
+        // Clear existing data and bulk-copy from source
+        let result = (|| -> Result<ImportResult> {
             conn.execute("DELETE FROM baseline_fp", [])
                 .context("Failed to clear existing baselines")?;
 
-            let count = conn
+            let baseline_count = conn
                 .execute(
                     "INSERT INTO baseline_fp (filename, method_checksums, mtime, fsha, created_at)
                  SELECT filename, method_checksums, mtime, fsha, created_at
@@ -712,17 +737,78 @@ impl PytestDiffDatabase {
             )
             .context("Failed to copy metadata from source")?;
 
-            Ok(count)
+            // Copy test execution data if source has those tables (backward compat)
+            let test_execution_count = if Self::source_table_exists(&conn, "test_execution")? {
+                // Delete existing test execution data (in FK order)
+                conn.execute("DELETE FROM test_execution_file_fp", [])
+                    .context("Failed to clear test_execution_file_fp")?;
+                conn.execute("DELETE FROM test_execution", [])
+                    .context("Failed to clear test_execution")?;
+                conn.execute("DELETE FROM file_fp", [])
+                    .context("Failed to clear file_fp")?;
+                conn.execute("DELETE FROM environment", [])
+                    .context("Failed to clear environment")?;
+
+                // Copy source IDs directly (no collision since we cleared everything)
+                conn.execute(
+                        "INSERT INTO environment (id, environment_name, system_packages, python_version)
+                         SELECT id, environment_name, system_packages, python_version
+                         FROM source_db.environment",
+                        [],
+                    )
+                    .context("Failed to copy environment from source")?;
+
+                conn.execute(
+                    "INSERT INTO file_fp (id, filename, method_checksums, mtime, fsha)
+                         SELECT id, filename, method_checksums, mtime, fsha
+                         FROM source_db.file_fp",
+                    [],
+                )
+                .context("Failed to copy file_fp from source")?;
+
+                let te_count = conn
+                        .execute(
+                            "INSERT INTO test_execution (id, environment_id, test_name, duration, failed, forced)
+                             SELECT id, environment_id, test_name, duration, failed, forced
+                             FROM source_db.test_execution",
+                            [],
+                        )
+                        .context("Failed to copy test_execution from source")?;
+
+                conn.execute(
+                    "INSERT INTO test_execution_file_fp (test_execution_id, fingerprint_id)
+                         SELECT test_execution_id, fingerprint_id
+                         FROM source_db.test_execution_file_fp",
+                    [],
+                )
+                .context("Failed to copy test_execution_file_fp from source")?;
+
+                te_count
+            } else {
+                0
+            };
+
+            Ok(ImportResult {
+                baseline_count,
+                test_execution_count,
+            })
         })();
 
         // Always detach, even if the copy failed
         conn.execute("DETACH DATABASE source_db", [])
             .context("Failed to detach source database")?;
 
+        // Invalidate cached environment ID since we replaced all environments
+        drop(conn);
+        {
+            let mut cached_id = self.current_environment_id.write();
+            *cached_id = None;
+        }
+
         result
     }
 
-    fn merge_baseline_from_internal(&mut self, source_db_path: &str) -> Result<usize> {
+    fn merge_baseline_from_internal(&mut self, source_db_path: &str) -> Result<ImportResult> {
         // Verify source file exists
         if !Path::new(source_db_path).exists() {
             anyhow::bail!("Source database does not exist: {}", source_db_path);
@@ -735,8 +821,8 @@ impl PytestDiffDatabase {
             .with_context(|| format!("Failed to attach source database: {}", source_db_path))?;
 
         // Merge baselines using INSERT OR REPLACE (does NOT clear existing baselines)
-        let result = (|| -> Result<usize> {
-            let count = conn
+        let result = (|| -> Result<ImportResult> {
+            let baseline_count = conn
                 .execute(
                     "INSERT OR REPLACE INTO baseline_fp (filename, method_checksums, mtime, fsha, created_at)
                      SELECT filename, method_checksums, mtime, fsha, created_at
@@ -753,12 +839,90 @@ impl PytestDiffDatabase {
             )
             .context("Failed to merge metadata from source")?;
 
-            Ok(count)
+            // Merge test execution data if source has those tables (backward compat)
+            let test_execution_count = if Self::source_table_exists(&conn, "test_execution")? {
+                // 1. Merge environments (natural key: name+packages+version)
+                conn.execute(
+                        "INSERT OR IGNORE INTO environment (environment_name, system_packages, python_version)
+                         SELECT environment_name, system_packages, python_version
+                         FROM source_db.environment",
+                        [],
+                    )
+                    .context("Failed to merge environment from source")?;
+
+                // 2. Merge file fingerprints (natural key: filename+fsha+checksums)
+                conn.execute(
+                    "INSERT OR IGNORE INTO file_fp (filename, method_checksums, mtime, fsha)
+                         SELECT filename, method_checksums, mtime, fsha
+                         FROM source_db.file_fp",
+                    [],
+                )
+                .context("Failed to merge file_fp from source")?;
+
+                // 3. Delete stale test executions for tests that exist in the source
+                //    CASCADE will clean up test_execution_file_fp
+                conn.execute(
+                    "DELETE FROM test_execution
+                         WHERE test_name IN (SELECT test_name FROM source_db.test_execution)",
+                    [],
+                )
+                .context("Failed to delete stale test executions")?;
+
+                // 4. Insert test executions with remapped environment_id
+                let te_count = conn
+                        .execute(
+                            "INSERT INTO test_execution (environment_id, test_name, duration, failed, forced)
+                             SELECT e.id, ste.test_name, ste.duration, ste.failed, ste.forced
+                             FROM source_db.test_execution ste
+                             JOIN source_db.environment se ON ste.environment_id = se.id
+                             JOIN environment e ON e.environment_name = se.environment_name
+                                AND e.system_packages = se.system_packages
+                                AND e.python_version = se.python_version",
+                            [],
+                        )
+                        .context("Failed to merge test_execution from source")?;
+
+                // 5. Insert junction rows with remapped IDs via natural key joins
+                conn.execute(
+                        "INSERT OR IGNORE INTO test_execution_file_fp (test_execution_id, fingerprint_id)
+                         SELECT te.id, fp.id
+                         FROM source_db.test_execution_file_fp steff
+                         JOIN source_db.test_execution ste ON steff.test_execution_id = ste.id
+                         JOIN source_db.environment se ON ste.environment_id = se.id
+                         JOIN source_db.file_fp sfp ON steff.fingerprint_id = sfp.id
+                         JOIN environment e ON e.environment_name = se.environment_name
+                            AND e.system_packages = se.system_packages
+                            AND e.python_version = se.python_version
+                         JOIN test_execution te ON te.test_name = ste.test_name
+                            AND te.environment_id = e.id
+                         JOIN file_fp fp ON fp.filename = sfp.filename
+                            AND fp.fsha = sfp.fsha
+                            AND fp.method_checksums = sfp.method_checksums",
+                        [],
+                    )
+                    .context("Failed to merge test_execution_file_fp from source")?;
+
+                te_count
+            } else {
+                0
+            };
+
+            Ok(ImportResult {
+                baseline_count,
+                test_execution_count,
+            })
         })();
 
         // Always detach, even if the merge failed
         conn.execute("DETACH DATABASE source_db", [])
             .context("Failed to detach source database")?;
+
+        // Invalidate cached environment ID since we may have added environments
+        drop(conn);
+        {
+            let mut cached_id = self.current_environment_id.write();
+            *cached_id = None;
+        }
 
         result
     }
@@ -986,10 +1150,11 @@ mod tests {
         assert_eq!(stats["baseline_count"], 0);
 
         // Import from source
-        let count = target_db
+        let result = target_db
             .import_baseline_from_internal(source_db_file.path().to_str().unwrap())
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(result.baseline_count, 2);
+        assert_eq!(result.test_execution_count, 0);
 
         // Verify baselines were imported
         let stats = target_db.get_stats_internal().unwrap();
@@ -1122,20 +1287,22 @@ mod tests {
         assert_eq!(stats["baseline_count"], 0);
 
         // Merge first source
-        let count1 = target_db
+        let result1 = target_db
             .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
             .unwrap();
-        assert_eq!(count1, 1);
+        assert_eq!(result1.baseline_count, 1);
+        assert_eq!(result1.test_execution_count, 0);
 
         // Verify first merge
         let stats = target_db.get_stats_internal().unwrap();
         assert_eq!(stats["baseline_count"], 1);
 
         // Merge second source (should accumulate, not replace)
-        let count2 = target_db
+        let result2 = target_db
             .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
             .unwrap();
-        assert_eq!(count2, 1);
+        assert_eq!(result2.baseline_count, 1);
+        assert_eq!(result2.test_execution_count, 0);
 
         // Verify both baselines exist
         let stats = target_db.get_stats_internal().unwrap();
@@ -1237,5 +1404,191 @@ mod tests {
         assert_eq!(affected.len(), 2);
         assert!(affected.contains(&"test_one".to_string()));
         assert!(affected.contains(&"test_two".to_string()));
+    }
+
+    #[test]
+    fn test_import_baseline_copies_test_executions() {
+        // Create source database with test execution data
+        let source_db_file = NamedTempFile::new().unwrap();
+        let mut source_db =
+            PytestDiffDatabase::new_internal(source_db_file.path().to_str().unwrap()).unwrap();
+
+        let fp = Fingerprint {
+            filename: "module.py".to_string(),
+            checksums: vec![100, 200],
+            file_hash: "hash1".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+
+        source_db
+            .save_test_execution_internal("test_one", vec![fp.clone()], 0.1, false, "3.12")
+            .unwrap();
+        source_db
+            .save_test_execution_internal("test_two", vec![fp], 0.2, false, "3.12")
+            .unwrap();
+        source_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "module.py".to_string(),
+                checksums: vec![100, 200],
+                file_hash: "hash1".to_string(),
+                mtime: 1.0,
+                blocks: None,
+            })
+            .unwrap();
+        source_db.close_and_checkpoint().unwrap();
+
+        // Import into target
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        let result = target_db
+            .import_baseline_from_internal(source_db_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(result.baseline_count, 1);
+        assert_eq!(result.test_execution_count, 2);
+
+        // Verify get_affected_tests works on the imported data
+        let mut changed = HashMap::new();
+        changed.insert("module.py".to_string(), vec![100]);
+
+        let affected = target_db.get_affected_tests_internal(changed).unwrap();
+        assert_eq!(affected.len(), 2);
+        assert!(affected.contains(&"test_one".to_string()));
+        assert!(affected.contains(&"test_two".to_string()));
+    }
+
+    #[test]
+    fn test_merge_copies_test_executions_with_remap() {
+        // Create first source with test execution data
+        let source1_file = NamedTempFile::new().unwrap();
+        let mut source1_db =
+            PytestDiffDatabase::new_internal(source1_file.path().to_str().unwrap()).unwrap();
+
+        let fp1 = Fingerprint {
+            filename: "module_a.py".to_string(),
+            checksums: vec![100],
+            file_hash: "hash_a".to_string(),
+            mtime: 1.0,
+            blocks: None,
+        };
+        source1_db
+            .save_test_execution_internal("test_alpha", vec![fp1], 0.1, false, "3.12")
+            .unwrap();
+        source1_db.close_and_checkpoint().unwrap();
+
+        // Create second source with different test execution data
+        let source2_file = NamedTempFile::new().unwrap();
+        let mut source2_db =
+            PytestDiffDatabase::new_internal(source2_file.path().to_str().unwrap()).unwrap();
+
+        let fp2 = Fingerprint {
+            filename: "module_b.py".to_string(),
+            checksums: vec![200],
+            file_hash: "hash_b".to_string(),
+            mtime: 2.0,
+            blocks: None,
+        };
+        source2_db
+            .save_test_execution_internal("test_beta", vec![fp2], 0.2, false, "3.12")
+            .unwrap();
+        source2_db.close_and_checkpoint().unwrap();
+
+        // Merge both into target
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        let result1 = target_db
+            .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(result1.test_execution_count, 1);
+
+        let result2 = target_db
+            .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(result2.test_execution_count, 1);
+
+        // Verify both tests are found via get_affected_tests
+        let mut changed_a = HashMap::new();
+        changed_a.insert("module_a.py".to_string(), vec![100]);
+        let affected_a = target_db.get_affected_tests_internal(changed_a).unwrap();
+        assert_eq!(affected_a, vec!["test_alpha"]);
+
+        let mut changed_b = HashMap::new();
+        changed_b.insert("module_b.py".to_string(), vec![200]);
+        let affected_b = target_db.get_affected_tests_internal(changed_b).unwrap();
+        assert_eq!(affected_b, vec!["test_beta"]);
+    }
+
+    #[test]
+    fn test_import_from_old_db_without_test_data() {
+        // Create a source database that only has baseline_fp (simulates old DB format)
+        // Since all DBs created by new_internal have the full schema, we simulate
+        // an "old" DB by just not inserting any test data
+        let source_db_file = NamedTempFile::new().unwrap();
+        let mut source_db =
+            PytestDiffDatabase::new_internal(source_db_file.path().to_str().unwrap()).unwrap();
+
+        source_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "module.py".to_string(),
+                checksums: vec![42],
+                file_hash: "hash42".to_string(),
+                mtime: 1.0,
+                blocks: None,
+            })
+            .unwrap();
+        source_db.close_and_checkpoint().unwrap();
+
+        // Import into target
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        let result = target_db
+            .import_baseline_from_internal(source_db_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(result.baseline_count, 1);
+        assert_eq!(result.test_execution_count, 0);
+
+        // Verify baseline was imported
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 1);
+    }
+
+    #[test]
+    fn test_merge_from_old_db_without_test_data() {
+        // Same as above but for merge path
+        let source_db_file = NamedTempFile::new().unwrap();
+        let mut source_db =
+            PytestDiffDatabase::new_internal(source_db_file.path().to_str().unwrap()).unwrap();
+
+        source_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "module.py".to_string(),
+                checksums: vec![42],
+                file_hash: "hash42".to_string(),
+                mtime: 1.0,
+                blocks: None,
+            })
+            .unwrap();
+        source_db.close_and_checkpoint().unwrap();
+
+        // Merge into target
+        let target_db_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_db_file.path().to_str().unwrap()).unwrap();
+
+        let result = target_db
+            .merge_baseline_from_internal(source_db_file.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(result.baseline_count, 1);
+        assert_eq!(result.test_execution_count, 0);
+
+        // Verify baseline was merged
+        let stats = target_db.get_stats_internal().unwrap();
+        assert_eq!(stats["baseline_count"], 1);
     }
 }

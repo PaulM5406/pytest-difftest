@@ -36,14 +36,19 @@ def merge_databases(output: str, inputs: list[str]) -> int:
     # Check for commit consistency before merging
     _check_merge_commit_consistency(db, inputs)
 
-    total = 0
+    total_baselines = 0
+    total_tests = 0
     for input_path in inputs:
-        count = db.merge_baseline_from(input_path)
-        print(f"Merged {count} baselines from {input_path}")
-        total += count
+        result = db.merge_baseline_from(input_path)
+        print(
+            f"Merged {result.baseline_count} baselines"
+            f" and {result.test_execution_count} test executions from {input_path}"
+        )
+        total_baselines += result.baseline_count
+        total_tests += result.test_execution_count
 
     db.close()
-    print(f"Total: {total} baselines in {output}")
+    print(f"Total: {total_baselines} baselines and {total_tests} test executions in {output}")
     return 0
 
 

@@ -101,13 +101,18 @@ def _download_single_baseline(
             return storage
         try:
             import_start = time.time()
-            count = db.import_baseline_from(str(tmp_path))
+            result = db.import_baseline_from(str(tmp_path))
             log.debug(
-                "Imported %s baseline fingerprints in %.3fs", count, time.time() - import_start
+                "Imported %s baseline fingerprints and %s test executions in %.3fs",
+                result.baseline_count,
+                result.test_execution_count,
+                time.time() - import_start,
             )
             logger.info(
-                "✓ pytest-diff: Imported %s baseline fingerprints from remote into %s",
-                count,
+                "✓ pytest-diff: Imported %s baseline fingerprints"
+                " and %s test executions from remote into %s",
+                result.baseline_count,
+                result.test_execution_count,
                 db_path,
             )
 
@@ -153,20 +158,34 @@ def _download_and_merge_baselines(
         _check_commit_consistency(db, downloaded_files, log)
 
         # Merge all downloaded databases
-        total_count = 0
+        total_baseline_count = 0
+        total_test_count = 0
         merge_start = time.time()
         for db_file in downloaded_files:
             try:
-                count = db.merge_baseline_from(str(db_file))
-                log.debug("Merged %d baselines from %s", count, db_file.name)
-                total_count += count
+                result = db.merge_baseline_from(str(db_file))
+                log.debug(
+                    "Merged %d baselines and %d test executions from %s",
+                    result.baseline_count,
+                    result.test_execution_count,
+                    db_file.name,
+                )
+                total_baseline_count += result.baseline_count
+                total_test_count += result.test_execution_count
             except Exception as e:
                 logger.warning("⚠ pytest-diff: Failed to merge baseline from %s: %s", db_file, e)
 
-        log.debug("Merged %d total baselines in %.3fs", total_count, time.time() - merge_start)
+        log.debug(
+            "Merged %d total baselines and %d test executions in %.3fs",
+            total_baseline_count,
+            total_test_count,
+            time.time() - merge_start,
+        )
         logger.info(
-            "✓ pytest-diff: Merged %d baseline fingerprints from %d files into %s",
-            total_count,
+            "✓ pytest-diff: Merged %d baseline fingerprints"
+            " and %d test executions from %d files into %s",
+            total_baseline_count,
+            total_test_count,
             len(downloaded_files),
             db_path,
         )

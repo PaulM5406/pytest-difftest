@@ -88,3 +88,70 @@ def test_detect_changes_no_baseline(tmp_path):
     # New files (no baseline) should be detected as changed
     assert changes.has_changes()
     assert len(changes.modified) == 1
+
+
+def test_import_baseline_returns_import_result(tmp_path):
+    """import_baseline_from returns ImportResult with both counts."""
+    source_path = tmp_path / "source.db"
+    source_db = _core.PytestDiffDatabase(str(source_path))
+
+    # Create a Python file and save test execution + baseline
+    f = tmp_path / "module.py"
+    f.write_text("def hello():\n    return 'world'\n")
+    fp = _core.calculate_fingerprint(str(f))
+    source_db.save_test_execution("test_hello", [fp], 0.1, False)
+    source_db.save_baseline_fingerprint(fp)
+    source_db.close()
+
+    # Import into target
+    target_path = tmp_path / "target.db"
+    target_db = _core.PytestDiffDatabase(str(target_path))
+    result = target_db.import_baseline_from(str(source_path))
+
+    assert isinstance(result, _core.ImportResult)
+    assert result.baseline_count == 1
+    assert result.test_execution_count == 1
+
+
+def test_merge_baseline_returns_import_result(tmp_path):
+    """merge_baseline_from returns ImportResult with both counts."""
+    source_path = tmp_path / "source.db"
+    source_db = _core.PytestDiffDatabase(str(source_path))
+
+    f = tmp_path / "module.py"
+    f.write_text("def hello():\n    return 'world'\n")
+    fp = _core.calculate_fingerprint(str(f))
+    source_db.save_test_execution("test_hello", [fp], 0.1, False)
+    source_db.save_baseline_fingerprint(fp)
+    source_db.close()
+
+    # Merge into target
+    target_path = tmp_path / "target.db"
+    target_db = _core.PytestDiffDatabase(str(target_path))
+    result = target_db.merge_baseline_from(str(source_path))
+
+    assert isinstance(result, _core.ImportResult)
+    assert result.baseline_count == 1
+    assert result.test_execution_count == 1
+
+
+def test_import_copies_test_execution_coverage(tmp_path):
+    """Imported test execution data enables get_affected_tests."""
+    source_path = tmp_path / "source.db"
+    source_db = _core.PytestDiffDatabase(str(source_path))
+
+    f = tmp_path / "module.py"
+    f.write_text("def hello():\n    return 'world'\n")
+    fp = _core.calculate_fingerprint(str(f))
+    source_db.save_test_execution("test_hello", [fp], 0.1, False)
+    source_db.save_baseline_fingerprint(fp)
+    source_db.close()
+
+    # Import into target
+    target_path = tmp_path / "target.db"
+    target_db = _core.PytestDiffDatabase(str(target_path))
+    target_db.import_baseline_from(str(source_path))
+
+    # get_affected_tests should find the imported test
+    affected = target_db.get_affected_tests({fp.filename: list(fp.checksums)})
+    assert "test_hello" in affected

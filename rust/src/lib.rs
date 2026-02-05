@@ -15,7 +15,7 @@ mod fingerprint_cache;
 mod parser;
 mod types;
 
-pub use database::PytestDiffDatabase;
+pub use database::{ImportResult, PytestDiffDatabase};
 pub use fingerprint::{
     calculate_fingerprint, detect_changes, process_coverage_data, save_baseline,
 };
@@ -32,6 +32,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ChangedFiles>()?;
     m.add_class::<TestExecution>()?;
     m.add_class::<PytestDiffDatabase>()?;
+    m.add_class::<ImportResult>()?;
     m.add_class::<FingerprintCache>()?;
 
     // Register functions

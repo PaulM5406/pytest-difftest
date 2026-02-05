@@ -4,6 +4,7 @@
 
 - Factorize common code
 - Split big class and method into smaller parts
+- Add at least one relevant test when fixing a bug
 
 ## Toolchain
 
