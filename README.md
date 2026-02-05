@@ -93,6 +93,7 @@ Code Change → AST Parsing (Rust) → Block Checksums → Database Query → Ru
 | **Sub-scope** (e.g. baseline=`tests/`, diff=`tests/unit/`) | No warning, baseline already covers the scope | No warning, proceeds normally |
 | **Broader scope** (e.g. baseline=`tests/unit/`, diff=`tests/`) | Warns, proceeds with test selection (may miss tests) | Warns, runs all tests to rebuild baseline |
 | **Both `--diff` and `--diff-baseline`** | `--diff-baseline` takes precedence, `--diff` is ignored | - |
+| **Failing tests** | Always re-selected (not recorded until they pass) | Re-run on incremental baseline until they pass |
 | **First baseline (empty DB)** | Runs all tests to build the database | Runs all tests |
 | **`--diff-force`** | N/A | Forces full rebuild, runs all tests |
 

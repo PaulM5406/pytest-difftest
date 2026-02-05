@@ -326,12 +326,20 @@ class PytestDiffPlugin:
                     changed = _core.detect_changes(
                         str(self.db_path), str(get_rootdir(config)), self.scope_paths
                     )
+
+                    # Find unrecorded tests (e.g. previously failed)
+                    recorded_tests = set(self.db.get_recorded_tests())
+                    unrecorded_tests = {
+                        item.nodeid for item in items if item.nodeid not in recorded_tests
+                    }
+
                     if changed.has_changes():
                         logger.info(
                             "\n✓ pytest-diff: Incremental baseline — %s modified files",
                             len(changed.modified),
                         )
-                        affected_tests = self.db.get_affected_tests(changed.changed_blocks)
+                        affected_tests = set(self.db.get_affected_tests(changed.changed_blocks))
+                        affected_tests |= unrecorded_tests
                         if affected_tests:
                             selected = [item for item in items if item.nodeid in affected_tests]
                             self.deselected_items = [item for item in items if item not in selected]
@@ -347,6 +355,16 @@ class PytestDiffPlugin:
                             logger.info("\n✓ pytest-diff: Incremental baseline — no tests affected")
                             self.deselected_items = items[:]
                             items[:] = []
+                            config.hook.pytest_deselected(items=self.deselected_items)
+                    elif unrecorded_tests:
+                        logger.info(
+                            "\n✓ pytest-diff: Incremental baseline — %s unrecorded tests",
+                            len(unrecorded_tests),
+                        )
+                        selected = [item for item in items if item.nodeid in unrecorded_tests]
+                        self.deselected_items = [item for item in items if item not in selected]
+                        items[:] = selected
+                        if self.deselected_items:
                             config.hook.pytest_deselected(items=self.deselected_items)
                     else:
                         # No changes — skip all tests
@@ -374,12 +392,19 @@ class PytestDiffPlugin:
                 str(self.db_path), str(get_rootdir(config)), self.scope_paths
             )
 
+            assert self.db is not None
+
+            # Find tests with no recorded execution (e.g. previously failed)
+            recorded_tests = set(self.db.get_recorded_tests())
+            unrecorded_tests = {item.nodeid for item in items if item.nodeid not in recorded_tests}
+            if unrecorded_tests:
+                logger.info("  %s unrecorded tests will be re-run", len(unrecorded_tests))
+
             if changed.has_changes():
                 logger.info("\n✓ pytest-diff: Detected %s modified files", len(changed.modified))
                 logger.info("  Changed blocks in %s files", len(changed.changed_blocks))
 
                 # Get affected tests from database
-                assert self.db is not None
                 affected_tests = set(self.db.get_affected_tests(changed.changed_blocks))
 
                 # Also select tests living in modified files (new test files)
@@ -387,6 +412,9 @@ class PytestDiffPlugin:
                 for item in items:
                     if str(Path(item.fspath).resolve()) in modified_abs:
                         affected_tests.add(item.nodeid)
+
+                # Include unrecorded tests
+                affected_tests |= unrecorded_tests
 
                 if affected_tests:
                     # Select only affected tests
@@ -413,6 +441,18 @@ class PytestDiffPlugin:
                         self.deselected_items = items[:]
                         items[:] = []
                         config.hook.pytest_deselected(items=self.deselected_items)
+            elif unrecorded_tests:
+                logger.info("\n✓ pytest-diff: No changes detected")
+                # Run unrecorded tests (previously failed)
+                selected = [item for item in items if item.nodeid in unrecorded_tests]
+                self.deselected_items = [item for item in items if item not in selected]
+                items[:] = selected
+
+                logger.info("  Running %s unrecorded tests", len(selected))
+                logger.info("  Skipping %s recorded tests", len(self.deselected_items))
+
+                if self.deselected_items:
+                    config.hook.pytest_deselected(items=self.deselected_items)
             else:
                 logger.info("\n✓ pytest-diff: No changes detected")
                 logger.info("  Skipping all %s tests", len(items))
@@ -542,9 +582,15 @@ class PytestDiffPlugin:
                     except Exception:
                         pass
 
+            # Skip failed tests so they remain "unknown" and get re-selected
+            # on the next --diff run until they pass
+            if failed:
+                logger.debug("Skipping failed test %s (will be re-selected next run)", item.nodeid)
+                return
+
             # Add to batch instead of saving immediately
             if fingerprints:
-                self.test_execution_batch.append((item.nodeid, fingerprints, duration, failed))
+                self.test_execution_batch.append((item.nodeid, fingerprints, duration, False))
                 logger.debug("Added to batch (size: %s)", len(self.test_execution_batch))
 
                 # Flush batch if it reaches batch_size

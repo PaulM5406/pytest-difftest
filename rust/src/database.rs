@@ -325,6 +325,16 @@ impl PytestDiffDatabase {
             })
     }
 
+    /// Get all test names that have recorded executions in the current environment
+    fn get_recorded_tests(&self) -> PyResult<Vec<String>> {
+        self.get_recorded_tests_internal().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to get recorded tests: {}",
+                e
+            ))
+        })
+    }
+
     /// Get stored fingerprint for a file
     fn get_fingerprint(&self, filename: &str) -> PyResult<Option<Fingerprint>> {
         self.get_fingerprint_internal(filename).map_err(|e| {
@@ -614,6 +624,15 @@ impl PytestDiffDatabase {
         result.sort();
 
         Ok(result)
+    }
+
+    fn get_recorded_tests_internal(&self) -> Result<Vec<String>> {
+        let conn = self.conn.read();
+        let mut stmt = conn.prepare("SELECT DISTINCT test_name FROM test_execution")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut tests: Vec<String> = rows.collect::<std::result::Result<_, _>>()?;
+        tests.sort();
+        Ok(tests)
     }
 
     fn get_stats_internal(&self) -> Result<HashMap<String, i64>> {
