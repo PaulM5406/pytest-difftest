@@ -109,7 +109,7 @@ Code Change → AST Parsing (Rust) → Block Checksums → Database Query → Ru
 | `--diff-v` | Enable verbose logging (shows timing and debug info) |
 | `--diff-batch-size N` | Number of test executions to batch before DB write (default: 20) |
 | `--diff-cache-size N` | Maximum fingerprints to cache in memory (default: 100000) |
-| `--diff-remote URL` | Remote storage URL for baseline DB (e.g. `s3://bucket/prefix/`, `s3://bucket/path/baseline.db`, `file:///path/`) |
+| `--diff-remote URL` | Remote storage URL for a single baseline DB file (e.g. `s3://bucket/baseline.db`) |
 | `--diff-upload` | Upload baseline DB to remote storage after `--diff-baseline` completes |
 
 ```bash
@@ -122,14 +122,11 @@ pytest --diff-baseline
 # Force a full baseline rebuild
 pytest --diff-baseline --diff-force
 
-# Save baseline and upload to S3 (prefix-style URL)
-pytest --diff-baseline --diff-upload --diff-remote "s3://my-bucket/pytest-diff/"
-
-# Save baseline to a specific S3 key
-pytest --diff-baseline --diff-upload --diff-remote "s3://my-bucket/baselines/my-baseline.db"
+# Save baseline and upload to S3
+pytest --diff-baseline --diff-upload --diff-remote "s3://my-bucket/baselines/baseline.db"
 
 # Run affected tests, fetching baseline from remote
-pytest --diff --diff-remote "s3://my-bucket/pytest-diff/"
+pytest --diff --diff-remote "s3://my-bucket/baselines/baseline.db"
 ```
 
 ### pyproject.toml
@@ -140,7 +137,7 @@ All options can be configured in `pyproject.toml` so you don't need to pass them
 [tool.pytest.ini_options]
 diff_batch_size = "50"
 diff_cache_size = "200000"
-diff_remote_url = "s3://my-ci-bucket/pytest-diff/"
+diff_remote_url = "s3://my-ci-bucket/baselines/baseline.db"
 diff_remote_key = "baseline.db"
 ```
 
@@ -154,41 +151,57 @@ pytest-diff supports storing the baseline database in remote storage, enabling a
 
 | Scheme | Backend | Requirements |
 |--------|---------|-------------|
-| `s3://bucket/prefix/` | Amazon S3 | `pip install pytest-diff[s3]` |
-| `file:///path/to/dir/` | Local filesystem | None |
+| `s3://bucket/path/file.db` | Amazon S3 | `pip install pytest-diff[s3]` |
+| `file:///path/to/file.db` | Local filesystem | None |
 
-**Typical CI/CD workflow:**
+**Simple CI/CD workflow (single job):**
 
-1. **CI (on merge to main):** `pytest --diff-baseline --diff-upload --diff-remote "s3://bucket/prefix/"`
-2. **Developer local:** `pytest --diff --diff-remote "s3://bucket/prefix/"` (auto-fetches latest baseline)
+1. **CI (on merge to main):** `pytest --diff-baseline --diff-upload --diff-remote "s3://bucket/baseline.db"`
+2. **Developer local:** `pytest --diff --diff-remote "s3://bucket/baseline.db"` (auto-fetches latest baseline)
 
 S3 uses ETag-based caching to avoid re-downloading unchanged baselines. Any S3 error (authentication, network, permissions, etc.) will **immediately abort the test run** to avoid silently running without a baseline.
 
-**Merging baselines from parallel CI jobs:**
+**Recommended CI workflow (parallel jobs):**
 
-When running tests in parallel across multiple CI jobs (e.g., pytest-xdist workers or matrix builds), each job can upload its baseline independently. Use a prefix-based URL to merge them:
+When running tests in parallel across multiple CI jobs, each job uploads its baseline to a unique key. A final step merges them and uploads the result:
 
 ```bash
-# CI jobs upload to unique paths
-aws s3 cp pytest_diff.db s3://bucket/pytest-diff/baselines/job-1.db
-aws s3 cp pytest_diff.db s3://bucket/pytest-diff/baselines/job-2.db
+# Step 1: Each CI job uploads its baseline to a unique key
+pytest --diff-baseline --diff-upload --diff-remote "s3://bucket/run-123/job-unit.db"
+pytest --diff-baseline --diff-upload --diff-remote "s3://bucket/run-123/job-integration.db"
 
-# Developers fetch from the prefix (merges all databases)
-pytest --diff --diff-remote "s3://bucket/pytest-diff/baselines/"
+# Step 2: Final CI step merges all baselines and uploads the result
+pytest-diff merge s3://bucket/baseline.db s3://bucket/run-123/
+
+# Step 3: Developers fetch the single merged baseline
+pytest --diff --diff-remote "s3://bucket/baseline.db"
 ```
-
-When the remote URL ends with `/`, pytest-diff downloads all `.db` files from that prefix and merges them into a single local baseline.
 
 ### CLI Commands
 
 pytest-diff provides a CLI for offline database operations:
 
 ```bash
-# Merge multiple databases into one
-pytest-diff merge output.db input1.db input2.db input3.db
+# Merge local database files
+pytest-diff merge output.db input1.db input2.db
+
+# Merge all .db files from a local directory
+pytest-diff merge output.db ./results/
+
+# Merge from a remote prefix (downloads all .db files from it)
+pytest-diff merge output.db s3://bucket/run-123/
+
+# Merge and upload result to S3
+pytest-diff merge s3://bucket/baseline.db input1.db input2.db
+
+# Full remote: download from prefix, merge, and upload
+pytest-diff merge s3://bucket/baseline.db s3://bucket/run-123/
+
+# Mix local files, directories, and remote inputs
+pytest-diff merge output.db input1.db ./results/ s3://bucket/run-123/
 ```
 
-This is useful for consolidating baselines from parallel CI jobs outside of the test run.
+The `output` argument can be a local path or a remote URL (s3://..., file://...). When it's a remote URL, a temporary file is used locally and uploaded at the end. Each input can be a local file, a local directory (collects all `.db` files), or a remote URL (prefix ending with `/` downloads all `.db` files).
 
 ## Development Setup
 

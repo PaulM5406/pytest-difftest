@@ -84,11 +84,17 @@ class PytestDiffPlugin:
         )
         self.remote_key: str = config.getini("diff_remote_key") or "baseline.db"
 
+        # --diff-remote only accepts single file URLs, not prefixes
+        if self.remote_url and self.remote_url.endswith("/"):
+            raise ValueError(
+                f"--diff-remote requires a single file URL, not a prefix: {self.remote_url}\n"
+                "  Use 'pytest-diff merge --from-remote' to merge multiple baselines from a prefix."
+            )
+
         # If remote URL points to a specific .db file, extract it as the remote key
         # e.g. s3://bucket/path/baseline.db -> url=s3://bucket/path/, key=baseline.db
         if (
             self.remote_url
-            and not self.remote_url.endswith("/")
             and self.remote_url.rsplit("/", 1)[-1].endswith(".db")
             and self.remote_key == "baseline.db"  # Only override default key
         ):
@@ -774,7 +780,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--diff-remote",
         type=str,
         default=None,
-        help="Remote storage URL for baseline DB (e.g. s3://bucket/prefix/, file:///path/)",
+        help="Remote storage URL for a single baseline DB file (e.g. s3://bucket/baseline.db)",
     )
 
     group.addoption(
@@ -800,7 +806,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "diff_remote_url",
         type="string",
         default="",
-        help="Remote storage URL for baseline DB (e.g. s3://bucket/prefix/, file:///path/)",
+        help="Remote storage URL for a single baseline DB file (e.g. s3://bucket/baseline.db)",
     )
     parser.addini(
         "diff_remote_key",

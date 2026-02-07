@@ -14,6 +14,41 @@ from typing import Any
 logger = logging.getLogger("pytest_diff")
 
 
+def parse_remote_url(url: str) -> tuple[str, str]:
+    """Split a remote URL into (base_url, key).
+
+    - ``s3://bucket/prefix/``         → ``("s3://bucket/prefix/", "")``
+    - ``s3://bucket/path/file.db``    → ``("s3://bucket/path/", "file.db")``
+    - ``file:///tmp/dir/``            → ``("file:///tmp/dir/", "")``
+    - ``file:///tmp/dir/baseline.db`` → ``("file:///tmp/dir/", "baseline.db")``
+    """
+    if url.endswith("/"):
+        return (url, "")
+    parts = url.rsplit("/", 1)
+    if len(parts) == 2:
+        return (parts[0] + "/", parts[1])
+    return (url, "")
+
+
+def download_remote_databases(remote_url: str, dest_dir: Path) -> list[Path]:
+    """Download all .db files from a remote prefix to *dest_dir*.
+
+    *remote_url* must be a prefix URL (ending with ``/``).
+    Returns the list of downloaded file paths.
+    """
+    from pytest_diff.storage import get_storage
+
+    base_url, _ = parse_remote_url(remote_url)
+    storage = get_storage(base_url)
+    if storage is None:
+        raise ValueError(f"Unsupported remote URL scheme: {remote_url}")
+
+    # The prefix is everything after the scheme+bucket in the base_url.
+    # For storage backends, we pass an empty prefix since the base_url
+    # already includes the full prefix path.
+    return storage.download_all(dest_dir)
+
+
 def init_storage(
     storage: Any,
     remote_url: str | None,
@@ -35,11 +70,6 @@ def init_storage(
     return storage
 
 
-def _is_prefix_key(remote_key: str) -> bool:
-    """Check if remote_key indicates a prefix (directory) rather than a single file."""
-    return not remote_key or remote_key.endswith("/")
-
-
 def download_and_import_baseline(
     storage: Any,
     remote_url: str | None,
@@ -49,10 +79,7 @@ def download_and_import_baseline(
     rootdir: str,
     log: Any,
 ) -> Any:
-    """Download remote baseline DB and import via ATTACH.
-
-    If remote_key is empty or ends with '/', treats it as a prefix and downloads
-    all .db files, merging them into the local database.
+    """Download a single remote baseline DB and import via ATTACH.
 
     *log* is a ``logging.Logger`` instance.
 
@@ -62,11 +89,6 @@ def download_and_import_baseline(
     if storage is None:
         return storage
 
-    # Handle prefix-based download (multiple databases)
-    if _is_prefix_key(remote_key):
-        return _download_and_merge_baselines(storage, remote_key, db, db_path, rootdir, log)
-
-    # Single file download (existing behavior)
     return _download_single_baseline(storage, remote_key, db, db_path, rootdir, log)
 
 
@@ -126,107 +148,6 @@ def _download_single_baseline(
     return storage
 
 
-def _download_and_merge_baselines(
-    storage: Any,
-    prefix: str,
-    db: Any,
-    db_path: Path,
-    rootdir: str,
-    log: Any,
-) -> Any:
-    """Download all baseline files from a prefix and merge them."""
-    dl_start = time.time()
-
-    # Create temp directory for downloaded files
-    temp_dir = Path(tempfile.mkdtemp(prefix="pytest_diff_"))
-
-    try:
-        downloaded_files = storage.download_all(temp_dir, prefix.rstrip("/"))
-
-        if not downloaded_files:
-            log.debug("No baseline files found at remote prefix — skipping import")
-            return storage
-
-        log.debug(
-            "Downloaded %d baseline files in %.3fs", len(downloaded_files), time.time() - dl_start
-        )
-
-        if db is None:
-            return storage
-
-        # Check for commit mismatches before merging
-        _check_commit_consistency(db, downloaded_files, log)
-
-        # Merge all downloaded databases
-        total_baseline_count = 0
-        total_test_count = 0
-        merge_start = time.time()
-        for db_file in downloaded_files:
-            try:
-                result = db.merge_baseline_from(str(db_file))
-                log.debug(
-                    "Merged %d baselines and %d test executions from %s",
-                    result.baseline_count,
-                    result.test_execution_count,
-                    db_file.name,
-                )
-                total_baseline_count += result.baseline_count
-                total_test_count += result.test_execution_count
-            except Exception as e:
-                logger.warning("⚠ pytest-diff: Failed to merge baseline from %s: %s", db_file, e)
-
-        log.debug(
-            "Merged %d total baselines and %d test executions in %.3fs",
-            total_baseline_count,
-            total_test_count,
-            time.time() - merge_start,
-        )
-        logger.info(
-            "✓ pytest-diff: Merged %d baseline fingerprints"
-            " and %d test executions from %d files into %s",
-            total_baseline_count,
-            total_test_count,
-            len(downloaded_files),
-            db_path,
-        )
-
-        _check_baseline_staleness(db, rootdir, log)
-
-    finally:
-        # Clean up temp directory
-        import shutil
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    return storage
-
-
-def _check_commit_consistency(db: Any, db_files: list[Path], log: Any) -> None:
-    """Check that all databases being merged have the same baseline_commit.
-
-    Warns if databases have different commits, which could indicate
-    they were generated from different CI runs.
-    """
-    commits: dict[str, list[str]] = {}  # commit -> list of filenames
-
-    for db_file in db_files:
-        try:
-            commit = db.get_external_metadata(str(db_file), "baseline_commit")
-            if commit:
-                commits.setdefault(commit, []).append(db_file.name)
-        except Exception as e:
-            log.debug("Could not read baseline_commit from %s: %s", db_file.name, e)
-
-    if len(commits) > 1:
-        # Multiple different commits found
-        details = ", ".join(f"{sha[:8]}({len(files)} files)" for sha, files in commits.items())
-        logger.warning(
-            "⚠ pytest-diff: Merging baselines from different commits: %s. "
-            "This may cause inconsistent test selection.",
-            details,
-        )
-
-
 def _check_baseline_staleness(db: Any, rootdir: str, log: Any) -> None:
     """Check if the baseline is stale compared to git history."""
     baseline_commit = db.get_metadata("baseline_commit")
@@ -265,3 +186,21 @@ def upload_baseline(
     logger.info("✓ pytest-diff: Uploaded baseline to %s", url)
 
     return storage
+
+
+def upload_to_remote(remote_url: str, local_path: Path) -> None:
+    """Upload a local file to a remote URL.
+
+    *remote_url* must point to a specific file (not a prefix).
+    """
+    from pytest_diff.storage import get_storage
+
+    base_url, key = parse_remote_url(remote_url)
+    if not key:
+        raise ValueError(f"Remote URL must point to a specific file, not a prefix: {remote_url}")
+
+    storage = get_storage(base_url)
+    if storage is None:
+        raise ValueError(f"Unsupported remote URL scheme: {remote_url}")
+
+    storage.upload(local_path, key)

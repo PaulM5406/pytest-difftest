@@ -7,6 +7,15 @@ from pathlib import Path
 import pytest
 
 
+def _create_source_db(db_path: Path, py_file: Path) -> None:
+    """Create a source database with a baseline fingerprint from a Python file."""
+    from pytest_diff._core import PytestDiffDatabase, calculate_fingerprint
+
+    db = PytestDiffDatabase(str(db_path))
+    db.save_baseline_fingerprint(calculate_fingerprint(str(py_file)))
+    db.close()
+
+
 class TestLocalStorage:
     """Tests for the local filesystem storage backend."""
 
@@ -98,6 +107,10 @@ class TestS3Storage:
 
 class TestS3AuthErrors:
     """Tests for S3 authentication error detection (uses mocks, no moto needed)."""
+
+    @pytest.fixture(autouse=True)
+    def _require_botocore(self) -> None:
+        pytest.importorskip("botocore")
 
     def test_download_access_denied_raises_auth_error(self, tmp_path: Path) -> None:
         from unittest.mock import MagicMock
@@ -333,3 +346,238 @@ class TestCommitConsistencyWarning:
         assert commit == "test_commit_sha"
         assert other == "other_value"
         assert missing is None
+
+
+class TestParseRemoteUrl:
+    """Tests for parse_remote_url helper."""
+
+    def test_prefix_url(self) -> None:
+        from pytest_diff._storage_ops import parse_remote_url
+
+        assert parse_remote_url("s3://bucket/prefix/") == ("s3://bucket/prefix/", "")
+
+    def test_file_url(self) -> None:
+        from pytest_diff._storage_ops import parse_remote_url
+
+        assert parse_remote_url("s3://bucket/path/baseline.db") == (
+            "s3://bucket/path/",
+            "baseline.db",
+        )
+
+    def test_file_url_local(self) -> None:
+        from pytest_diff._storage_ops import parse_remote_url
+
+        assert parse_remote_url("file:///tmp/dir/baseline.db") == (
+            "file:///tmp/dir/",
+            "baseline.db",
+        )
+
+    def test_prefix_url_local(self) -> None:
+        from pytest_diff._storage_ops import parse_remote_url
+
+        assert parse_remote_url("file:///tmp/dir/") == ("file:///tmp/dir/", "")
+
+
+class TestCliMergeRemote:
+    """Tests for CLI merge with remote support using file:// URLs."""
+
+    def test_merge_from_remote_prefix(self, tmp_path: Path) -> None:
+        from pytest_diff._core import PytestDiffDatabase
+        from pytest_diff.cli import merge_databases
+
+        # Set up remote directory with .db files
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+
+        _create_source_db(remote_dir / "job1.db", foo_file)
+        _create_source_db(remote_dir / "job2.db", bar_file)
+
+        output_path = tmp_path / "merged.db"
+        result = merge_databases(
+            str(output_path),
+            [f"file://{remote_dir}/"],
+        )
+
+        assert result == 0
+        db = PytestDiffDatabase(str(output_path))
+        stats = db.get_stats()
+        assert stats["baseline_count"] == 2
+
+    def test_merge_to_remote(self, tmp_path: Path) -> None:
+        from pytest_diff.cli import merge_databases
+
+        # Create local source databases
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+
+        source1 = tmp_path / "source1.db"
+        source2 = tmp_path / "source2.db"
+        _create_source_db(source1, foo_file)
+        _create_source_db(source2, bar_file)
+
+        # Set up remote destination
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+
+        result = merge_databases(
+            f"file://{remote_dir}/baseline.db",
+            [str(source1), str(source2)],
+        )
+
+        assert result == 0
+        assert (remote_dir / "baseline.db").exists()
+
+    def test_merge_full_remote_round_trip(self, tmp_path: Path) -> None:
+        """Remote-to-remote merge: download from prefix, upload to remote URL."""
+        from pytest_diff._core import PytestDiffDatabase
+        from pytest_diff.cli import merge_databases
+
+        # Set up remote source with .db files
+        remote_src = tmp_path / "remote_src"
+        remote_src.mkdir()
+
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+
+        _create_source_db(remote_src / "job1.db", foo_file)
+        _create_source_db(remote_src / "job2.db", bar_file)
+
+        # Set up remote destination
+        remote_dst = tmp_path / "remote_dst"
+        remote_dst.mkdir()
+
+        # Remote output + remote input prefix
+        result = merge_databases(
+            f"file://{remote_dst}/baseline.db",
+            [f"file://{remote_src}/"],
+        )
+
+        assert result == 0
+        assert (remote_dst / "baseline.db").exists()
+
+        # Verify the uploaded file is a valid database
+        db = PytestDiffDatabase(str(remote_dst / "baseline.db"))
+        stats = db.get_stats()
+        assert stats["baseline_count"] == 2
+
+    def test_merge_local_output_remote_input(self, tmp_path: Path) -> None:
+        """Merge remote inputs into a local output path."""
+        from pytest_diff._core import PytestDiffDatabase
+        from pytest_diff.cli import merge_databases
+
+        remote_src = tmp_path / "remote_src"
+        remote_src.mkdir()
+
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+
+        _create_source_db(remote_src / "job1.db", foo_file)
+        _create_source_db(remote_src / "job2.db", bar_file)
+
+        output_path = tmp_path / "merged.db"
+        result = merge_databases(
+            str(output_path),
+            [f"file://{remote_src}/"],
+        )
+
+        assert result == 0
+        assert output_path.exists()
+
+        db = PytestDiffDatabase(str(output_path))
+        stats = db.get_stats()
+        assert stats["baseline_count"] == 2
+
+    def test_merge_mixed_local_and_remote(self, tmp_path: Path) -> None:
+        from pytest_diff._core import PytestDiffDatabase
+        from pytest_diff.cli import merge_databases
+
+        # Set up remote source
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+        baz_file = tmp_path / "baz.py"
+        baz_file.write_text("def baz():\n    return 'baz'\n")
+
+        _create_source_db(remote_dir / "remote_job.db", foo_file)
+
+        local_source = tmp_path / "local.db"
+        _create_source_db(local_source, bar_file)
+
+        local_source2 = tmp_path / "local2.db"
+        _create_source_db(local_source2, baz_file)
+
+        output_path = tmp_path / "merged.db"
+        result = merge_databases(
+            str(output_path),
+            [str(local_source), str(local_source2), f"file://{remote_dir}/"],
+        )
+
+        assert result == 0
+        db = PytestDiffDatabase(str(output_path))
+        stats = db.get_stats()
+        assert stats["baseline_count"] == 3
+
+    def test_merge_from_remote_empty_prefix(self, tmp_path: Path, capsys) -> None:
+        from pytest_diff.cli import merge_databases
+
+        # Remote dir exists but has no .db files
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+
+        output_path = tmp_path / "merged.db"
+        result = merge_databases(
+            str(output_path),
+            [f"file://{remote_dir}/"],
+        )
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "No .db files found" in captured.err
+
+    def test_merge_from_local_directory(self, tmp_path: Path) -> None:
+        from pytest_diff._core import PytestDiffDatabase
+        from pytest_diff.cli import merge_databases
+
+        # Set up a local directory with .db files
+        input_dir = tmp_path / "inputs"
+        input_dir.mkdir()
+
+        foo_file = tmp_path / "foo.py"
+        foo_file.write_text("def foo():\n    return 'foo'\n")
+        bar_file = tmp_path / "bar.py"
+        bar_file.write_text("def bar():\n    return 'bar'\n")
+
+        _create_source_db(input_dir / "job1.db", foo_file)
+        _create_source_db(input_dir / "job2.db", bar_file)
+
+        output_path = tmp_path / "merged.db"
+        result = merge_databases(str(output_path), [str(input_dir)])
+
+        assert result == 0
+        db = PytestDiffDatabase(str(output_path))
+        stats = db.get_stats()
+        assert stats["baseline_count"] == 2
+
+    def test_merge_no_inputs_error(self, capsys) -> None:
+        from pytest_diff.cli import merge_databases
+
+        result = merge_databases("output.db", [])
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "input database required" in captured.err
