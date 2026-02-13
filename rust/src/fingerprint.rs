@@ -18,6 +18,15 @@ use crate::database::PytestDiffDatabase;
 use crate::parser::parse_module_internal;
 use crate::types::{Block, ChangedFiles, Fingerprint};
 
+/// Convert an absolute path to a relative path by stripping the project root prefix.
+/// Falls back to the original path if it doesn't start with project_root.
+fn make_relative(abs_path: &str, project_root: &str) -> String {
+    Path::new(abs_path)
+        .strip_prefix(project_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| abs_path.to_string())
+}
+
 /// Calculate fingerprint for a single Python file
 ///
 /// # Arguments
@@ -26,10 +35,15 @@ use crate::types::{Block, ChangedFiles, Fingerprint};
 /// # Returns
 /// * Fingerprint containing blocks, checksums, hash, and mtime
 #[pyfunction]
-pub fn calculate_fingerprint(path: &str) -> PyResult<Fingerprint> {
-    let fingerprint = calculate_fingerprint_internal(path).map_err(|e| {
+#[pyo3(signature = (path, project_root=None))]
+pub fn calculate_fingerprint(path: &str, project_root: Option<&str>) -> PyResult<Fingerprint> {
+    let mut fingerprint = calculate_fingerprint_internal(path).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("Failed to calculate fingerprint: {}", e))
     })?;
+
+    if let Some(root) = project_root {
+        fingerprint.filename = make_relative(&fingerprint.filename, root);
+    }
 
     Ok(fingerprint)
 }
@@ -166,6 +180,7 @@ fn save_baseline_internal(
         .par_iter()
         .map(|path| {
             let path_str = path.to_string_lossy().to_string();
+            let rel_path = make_relative(&path_str, project_root);
 
             // Update progress counter
             let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -184,8 +199,9 @@ fn save_baseline_internal(
             }
 
             // Check if we can skip this file (hash unchanged) - only when not forcing
+            // Lookup by relative path since baselines are stored with relative paths
             if !force {
-                if let Some(existing) = existing_baselines.get(&path_str) {
+                if let Some(existing) = existing_baselines.get(&rel_path) {
                     // Compute Blake3 hash (cheap: ~1ms for typical file)
                     if let Ok(content) = std::fs::read_to_string(path) {
                         let current_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
@@ -193,7 +209,7 @@ fn save_baseline_internal(
                         if current_hash == existing.file_hash {
                             // Hash matches - file content unchanged, skip expensive AST parsing
                             skipped_unchanged.fetch_add(1, Ordering::Relaxed);
-                            return (path_str, None); // None means "keep existing"
+                            return (rel_path, None); // None means "keep existing"
                         }
                     }
                 }
@@ -213,12 +229,16 @@ fn save_baseline_internal(
             }
 
             match result {
-                Ok(fp) => (path_str, Some(fp)),
+                Ok(mut fp) => {
+                    // Store relative path in the fingerprint
+                    fp.filename = rel_path.clone();
+                    (rel_path, Some(fp))
+                }
                 Err(e) => {
                     if verbose {
-                        eprintln!("[rust]   Skipping {}: {}", path_str, e);
+                        eprintln!("[rust]   Skipping {}: {}", rel_path, e);
                     }
-                    (path_str, None)
+                    (rel_path, None)
                 }
             }
         })
@@ -339,13 +359,15 @@ fn detect_changes_internal(
     // Now that we have all baselines in memory, we don't need DB access per file
     let changed_entries: Vec<_> = python_files
         .par_iter()
-        .filter_map(
-            |path| match check_file_changed_with_baseline(&baselines, path) {
+        .filter_map(|path| {
+            let abs_path = path.to_string_lossy().to_string();
+            let rel_path = make_relative(&abs_path, project_root);
+            match check_file_changed_with_baseline(&baselines, path, &rel_path) {
                 Ok(Some(change)) => Some(change),
                 Ok(None) => None,
                 Err(_) => None,
-            },
-        )
+            }
+        })
         .collect();
 
     // Separate modified files from changed blocks
@@ -367,22 +389,23 @@ fn detect_changes_internal(
 
 /// Check if a file has changed using three-level detection (with pre-loaded baseline)
 ///
-/// This version takes a pre-loaded HashMap of baselines for parallel processing
+/// This version takes a pre-loaded HashMap of baselines for parallel processing.
+/// `rel_filename` is the path relative to project root, used for DB lookups and return values.
+/// `path` is the absolute path, used for file I/O operations.
 fn check_file_changed_with_baseline(
     baselines: &HashMap<String, Fingerprint>,
     path: &Path,
+    rel_filename: &str,
 ) -> Result<Option<(String, Vec<i32>)>> {
-    let filename = path.to_string_lossy().to_string();
-
-    // Get baseline fingerprint from pre-loaded map
-    let stored_fp = match baselines.get(&filename) {
+    // Get baseline fingerprint from pre-loaded map (keyed by relative path)
+    let stored_fp = match baselines.get(rel_filename) {
         Some(fp) => fp,
         None => {
             // No baseline for this file - it's new, treat as changed
             // Parse to get checksums so new tests in this file can be selected
-            let current_fp = calculate_fingerprint(path.to_string_lossy().as_ref())?;
+            let current_fp = calculate_fingerprint_internal(path.to_string_lossy().as_ref())?;
             let checksums = current_fp.checksums.clone();
-            return Ok(Some((filename, checksums)));
+            return Ok(Some((rel_filename.to_string(), checksums)));
         }
     };
 
@@ -409,7 +432,7 @@ fn check_file_changed_with_baseline(
 
     // Level 3: block checksum comparison (precise)
     let current_blocks = parse_module_internal(&content)
-        .map_err(|e| anyhow::anyhow!("Parse error in {}: {}", filename, e))?;
+        .map_err(|e| anyhow::anyhow!("Parse error in {}: {}", rel_filename, e))?;
 
     let current_checksums: Vec<i32> = current_blocks.iter().map(|b| b.checksum).collect();
 
@@ -421,7 +444,7 @@ fn check_file_changed_with_baseline(
     // Find which specific blocks changed
     let changed_checksums = find_changed_checksums(&stored_fp.checksums, &current_checksums);
 
-    Ok(Some((filename, changed_checksums)))
+    Ok(Some((rel_filename.to_string(), changed_checksums)))
 }
 
 /// Find all Python files in a directory
@@ -650,7 +673,7 @@ fn process_coverage_data_internal(
             let filtered_checksums: Vec<i32> = executed_blocks.iter().map(|b| b.checksum).collect();
 
             Some(Fingerprint {
-                filename: fp.filename,
+                filename: make_relative(&fp.filename, project_root),
                 checksums: filtered_checksums,
                 file_hash: fp.file_hash,
                 mtime: fp.mtime,
@@ -778,5 +801,32 @@ mod tests {
 
         assert_eq!(fp1.file_hash, fp2.file_hash);
         assert_eq!(fp1.checksums, fp2.checksums);
+    }
+
+    #[test]
+    fn test_make_relative() {
+        // Standard case: path under project root
+        assert_eq!(
+            make_relative("/home/user/project/src/main.py", "/home/user/project"),
+            "src/main.py"
+        );
+
+        // Path equals project root (edge case)
+        assert_eq!(
+            make_relative("/home/user/project", "/home/user/project"),
+            ""
+        );
+
+        // Path not under project root: falls back to absolute
+        assert_eq!(
+            make_relative("/other/path/file.py", "/home/user/project"),
+            "/other/path/file.py"
+        );
+
+        // Trailing slash on project root
+        assert_eq!(
+            make_relative("/home/user/project/src/main.py", "/home/user/project/"),
+            "src/main.py"
+        );
     }
 }

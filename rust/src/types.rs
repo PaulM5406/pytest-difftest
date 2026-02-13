@@ -73,7 +73,7 @@ impl Block {
 #[pyclass]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fingerprint {
-    /// Absolute path to the file
+    /// Path to the file (relative to project root when stored in DB)
     #[pyo3(get)]
     pub filename: String,
 

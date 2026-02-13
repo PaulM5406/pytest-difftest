@@ -135,6 +135,45 @@ def test_merge_baseline_returns_import_result(tmp_path):
     assert result.test_execution_count == 1
 
 
+def test_detect_changes_returns_relative_paths(tmp_path):
+    """detect_changes returns paths relative to project_root, not absolute."""
+    db_path = tmp_path / "test.db"
+    _core.PytestDiffDatabase(str(db_path))
+
+    # Create a subdirectory with a Python file
+    subdir = tmp_path / "src"
+    subdir.mkdir()
+    f = subdir / "module.py"
+    f.write_text("def foo(): pass\n")
+
+    changes = _core.detect_changes(str(db_path), str(tmp_path), [str(tmp_path)])
+    assert changes.has_changes()
+    # All paths should be relative (not starting with /)
+    for path in changes.modified:
+        assert not path.startswith("/"), f"Expected relative path, got: {path}"
+    # Should contain the relative path
+    assert "src/module.py" in changes.modified
+
+
+def test_save_baseline_stores_relative_paths(tmp_path):
+    """save_baseline stores relative paths in the database."""
+    db_path = tmp_path / "test.db"
+
+    # Create a subdirectory with a Python file
+    subdir = tmp_path / "src"
+    subdir.mkdir()
+    f = subdir / "module.py"
+    f.write_text("def foo(): pass\n")
+
+    _core.save_baseline(str(db_path), str(tmp_path), False, [str(tmp_path)])
+
+    # Check that the stored baseline uses relative path
+    db = _core.PytestDiffDatabase(str(db_path))
+    fp = db.get_baseline_fingerprint("src/module.py")
+    assert fp is not None, "Baseline should be stored with relative path"
+    assert fp.filename == "src/module.py"
+
+
 def test_import_copies_test_execution_coverage(tmp_path):
     """Imported test execution data enables get_affected_tests."""
     source_path = tmp_path / "source.db"

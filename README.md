@@ -20,6 +20,7 @@ pytest-diff is a pytest plugin that intelligently selects and runs only the test
 - 🔧 **pytest-xdist compatible** - Works with parallel test execution
 - 💾 **SQLite storage** - Reliable, portable test dependency database
 - 🚀 **Upload/Download baseline to S3** - Easily share baseline of tests across a team
+- 📦 **Portable baselines** - Stores relative paths so baselines work across machines (CI → local)
 
 ## Installation
 

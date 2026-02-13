@@ -414,7 +414,9 @@ class PytestDiffPlugin:
                 affected_tests = set(self.db.get_affected_tests(changed.changed_blocks))
 
                 # Also select tests living in modified files (new test files)
-                modified_abs = {str(Path(f).resolve()) for f in changed.modified}
+                # changed.modified contains relative paths; resolve them against rootdir
+                rootdir = get_rootdir(config)
+                modified_abs = {str((rootdir / f).resolve()) for f in changed.modified}
                 for item in items:
                     if str(Path(item.fspath).resolve()) in modified_abs:
                         affected_tests.add(item.nodeid)
@@ -584,7 +586,11 @@ class PytestDiffPlugin:
                 test_file_str = str(test_file)
                 if test_file.exists() and test_file.suffix == ".py":
                     try:
-                        fingerprints.append(_core.calculate_fingerprint(test_file_str))
+                        fingerprints.append(
+                            _core.calculate_fingerprint(
+                                test_file_str, str(get_rootdir(self.config))
+                            )
+                        )
                     except Exception:
                         pass
 
