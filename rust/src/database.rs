@@ -722,6 +722,70 @@ impl PytestDiffDatabase {
         Ok(count > 0)
     }
 
+    /// Merge metadata from attached source_db into the main database.
+    ///
+    /// Most metadata keys use INSERT OR REPLACE (last writer wins).
+    /// `baseline_scope` is special: its JSON arrays are unioned so that
+    /// merging databases with different scopes produces the combined scope.
+    fn merge_metadata(conn: &Connection) -> Result<()> {
+        // Read existing baseline_scope from target (before overwrite)
+        let existing_scope: Option<String> = conn
+            .query_row(
+                "SELECT data FROM metadata WHERE dataid = 'baseline_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read existing baseline_scope")?;
+
+        // Overwrite all metadata from source
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (dataid, data)
+             SELECT dataid, data FROM source_db.metadata",
+            [],
+        )
+        .context("Failed to merge metadata from source")?;
+
+        // Union baseline_scope arrays if both sides had one
+        if let Some(existing) = existing_scope {
+            let source_scope: Option<String> = conn
+                .query_row(
+                    "SELECT data FROM metadata WHERE dataid = 'baseline_scope'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("Failed to read source baseline_scope")?;
+
+            if let Some(source) = source_scope {
+                let merged = Self::union_json_arrays(&existing, &source)?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata (dataid, data) VALUES ('baseline_scope', ?1)",
+                    params![merged],
+                )
+                .context("Failed to write merged baseline_scope")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse two JSON arrays of strings and return their sorted union as JSON.
+    fn union_json_arrays(a: &str, b: &str) -> Result<String> {
+        let mut set: HashSet<String> = HashSet::new();
+
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(a) {
+            set.extend(arr);
+        }
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(b) {
+            set.extend(arr);
+        }
+
+        let mut merged: Vec<String> = set.into_iter().collect();
+        merged.sort();
+        Ok(serde_json::to_string(&merged)?)
+    }
+
     fn import_baseline_from_internal(&mut self, source_db_path: &str) -> Result<ImportResult> {
         // Verify source file exists
         if !Path::new(source_db_path).exists() {
@@ -850,13 +914,8 @@ impl PytestDiffDatabase {
                 )
                 .context("Failed to merge baselines from source")?;
 
-            // Also merge metadata rows from source (e.g. baseline_commit SHA)
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata (dataid, data)
-                 SELECT dataid, data FROM source_db.metadata",
-                [],
-            )
-            .context("Failed to merge metadata from source")?;
+            // Merge metadata: union baseline_scope JSON arrays, replace everything else
+            Self::merge_metadata(&conn)?;
 
             // Merge test execution data if source has those tables (backward compat)
             let test_execution_count = if Self::source_table_exists(&conn, "test_execution")? {
@@ -1671,5 +1730,131 @@ mod tests {
         // Verify baseline was merged
         let stats = target_db.get_stats_internal().unwrap();
         assert_eq!(stats["baseline_count"], 1);
+    }
+
+    #[test]
+    fn test_merge_unions_baseline_scope_metadata() {
+        // Source 1: scope = ["tests/integration/oh"]
+        let source1_file = NamedTempFile::new().unwrap();
+        let mut source1_db =
+            PytestDiffDatabase::new_internal(source1_file.path().to_str().unwrap()).unwrap();
+        source1_db
+            .set_metadata_internal("baseline_scope", r#"["tests/integration/oh"]"#)
+            .unwrap();
+        source1_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "a.py".to_string(),
+                checksums: vec![1],
+                file_hash: "h1".to_string(),
+                mtime: 1.0,
+                blocks: None,
+            })
+            .unwrap();
+        source1_db.close_and_checkpoint().unwrap();
+
+        // Source 2: scope = ["tests/integration/oh_worker", "tests/integration/factories"]
+        let source2_file = NamedTempFile::new().unwrap();
+        let mut source2_db =
+            PytestDiffDatabase::new_internal(source2_file.path().to_str().unwrap()).unwrap();
+        source2_db
+            .set_metadata_internal(
+                "baseline_scope",
+                r#"["tests/integration/oh_worker","tests/integration/factories"]"#,
+            )
+            .unwrap();
+        source2_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "b.py".to_string(),
+                checksums: vec![2],
+                file_hash: "h2".to_string(),
+                mtime: 2.0,
+                blocks: None,
+            })
+            .unwrap();
+        source2_db.close_and_checkpoint().unwrap();
+
+        // Merge both into target
+        let target_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_file.path().to_str().unwrap()).unwrap();
+
+        target_db
+            .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
+            .unwrap();
+        target_db
+            .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
+            .unwrap();
+
+        // baseline_scope should be the union of both, sorted
+        let scope = target_db
+            .get_metadata_internal("baseline_scope")
+            .unwrap()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&scope).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "tests/integration/factories",
+                "tests/integration/oh",
+                "tests/integration/oh_worker",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_baseline_scope_with_duplicates() {
+        // Two sources with overlapping scopes
+        let source1_file = NamedTempFile::new().unwrap();
+        let mut source1_db =
+            PytestDiffDatabase::new_internal(source1_file.path().to_str().unwrap()).unwrap();
+        source1_db
+            .set_metadata_internal("baseline_scope", r#"["tests/a","tests/b"]"#)
+            .unwrap();
+        source1_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "a.py".to_string(),
+                checksums: vec![1],
+                file_hash: "h1".to_string(),
+                mtime: 1.0,
+                blocks: None,
+            })
+            .unwrap();
+        source1_db.close_and_checkpoint().unwrap();
+
+        let source2_file = NamedTempFile::new().unwrap();
+        let mut source2_db =
+            PytestDiffDatabase::new_internal(source2_file.path().to_str().unwrap()).unwrap();
+        source2_db
+            .set_metadata_internal("baseline_scope", r#"["tests/b","tests/c"]"#)
+            .unwrap();
+        source2_db
+            .save_baseline_fingerprint_internal(Fingerprint {
+                filename: "b.py".to_string(),
+                checksums: vec![2],
+                file_hash: "h2".to_string(),
+                mtime: 2.0,
+                blocks: None,
+            })
+            .unwrap();
+        source2_db.close_and_checkpoint().unwrap();
+
+        let target_file = NamedTempFile::new().unwrap();
+        let mut target_db =
+            PytestDiffDatabase::new_internal(target_file.path().to_str().unwrap()).unwrap();
+
+        target_db
+            .merge_baseline_from_internal(source1_file.path().to_str().unwrap())
+            .unwrap();
+        target_db
+            .merge_baseline_from_internal(source2_file.path().to_str().unwrap())
+            .unwrap();
+
+        let scope = target_db
+            .get_metadata_internal("baseline_scope")
+            .unwrap()
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&scope).unwrap();
+        // Duplicates removed, sorted
+        assert_eq!(parsed, vec!["tests/a", "tests/b", "tests/c"]);
     }
 }
