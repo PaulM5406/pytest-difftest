@@ -214,8 +214,9 @@ class PytestDiffPlugin:
             time.time() - cache_start,
         )
 
-        # Initialize coverage if available
-        self._init_coverage(config)
+        # Initialize coverage only in baseline mode (--diff mode never processes it)
+        if self.baseline:
+            self._init_coverage(config)
 
         # Skip remote download - controller already did it
         logger.debug("Worker pytest_configure completed in %.3fs", time.time() - start)
@@ -266,8 +267,9 @@ class PytestDiffPlugin:
             time.time() - cache_start,
         )
 
-        # Initialize coverage if available
-        self._init_coverage(config)
+        # Initialize coverage only in baseline mode (--diff mode never processes it)
+        if self.baseline:
+            self._init_coverage(config)
 
         # Remote baseline: download and import if --diff mode + remote configured
         if self.remote_url and not self.baseline:
