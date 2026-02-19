@@ -9,8 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  ci-check:
+    name: Verify CI passed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CI workflow status for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=${{ github.sha }}
+          STATUS=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs" \
+            --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .conclusion" | head -1)
+          if [ "$STATUS" != "success" ]; then
+            echo "::error::CI workflow has not passed for commit $SHA (status: ${STATUS:-not found})"
+            exit 1
+          fi
+
   build-wheels:
     name: "Build wheels (${{ matrix.target }})"
+    needs: [ci-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -47,6 +64,7 @@ jobs:
 
   build-sdist:
     name: Build sdist
+    needs: [ci-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

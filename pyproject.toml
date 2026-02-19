@@ -9,6 +9,7 @@ description = "Blazingly fast test selection for pytest - only run tests affecte
 readme = "README.md"
 authors = [{name = "Paul Milesi"}]
 license = {text = "MIT"}
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
     "pytest>=7.0",

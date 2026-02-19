@@ -58,7 +58,26 @@ git push origin main
 
 ## 6. Tag and push tag
 
+If the tag already exists (e.g. failed release), delete it locally and remotely first:
+
+```bash
+git tag -d vX.Y.Z
+git push origin :refs/tags/vX.Y.Z
 ```
+
+Then create and push the tag:
+
+```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
+
+## 7. Verify release
+
+Check that the Release pipeline triggered by the tag is running:
+
+```bash
+gh run list --limit 5
+```
+
+Report the status to the user and provide the run URL if available.
