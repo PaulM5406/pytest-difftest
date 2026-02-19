@@ -13,17 +13,27 @@ jobs:
     name: Verify CI passed
     runs-on: ubuntu-latest
     steps:
-      - name: Check CI workflow status for this commit
+      - name: Wait for CI workflow to pass
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           SHA=${{ github.sha }}
-          STATUS=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs" \
-            --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .conclusion" | head -1)
-          if [ "$STATUS" != "success" ]; then
-            echo "::error::CI workflow has not passed for commit $SHA (status: ${STATUS:-not found})"
-            exit 1
-          fi
+          echo "Waiting for CI to complete on $SHA..."
+          for i in $(seq 1 30); do
+            STATUS=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs" \
+              --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .conclusion" | head -1)
+            if [ "$STATUS" = "success" ]; then
+              echo "CI passed!"
+              exit 0
+            elif [ "$STATUS" = "failure" ] || [ "$STATUS" = "cancelled" ]; then
+              echo "::error::CI workflow failed for commit $SHA (status: $STATUS)"
+              exit 1
+            fi
+            echo "Attempt $i/30: CI status is '${STATUS:-pending}', waiting 30s..."
+            sleep 30
+          done
+          echo "::error::Timed out waiting for CI to pass (15 minutes)"
+          exit 1
 
   build-wheels:
     name: "Build wheels (${{ matrix.target }})"
