@@ -31,7 +31,14 @@ Run `git status` (no -uall flag), `git diff --staged`, `git diff`, and `git log 
 - Present the suggested version and a one-line rationale to the user
 - **Wait for the user to confirm or adjust** before proceeding
 
-## 4. Update CHANGELOG.md
+## 4. Bump version
+
+Update the version number in both files to match the confirmed version (without the `v` prefix):
+
+- `pyproject.toml` → `version = "X.Y.Z"`
+- `Cargo.toml` (workspace) → `version = "X.Y.Z"`
+
+## 5. Update CHANGELOG.md
 
 The changelog follows the [Keep a Changelog](https://keepachangelog.com/) format. If `CHANGELOG.md` does not exist, create it. Read it before editing.
 
@@ -44,7 +51,7 @@ The changelog follows the [Keep a Changelog](https://keepachangelog.com/) format
 - Each entry is a concise bullet point describing the change from a user perspective
 - Do NOT include internal refactoring details unless they affect users
 
-## 5. Stage, commit, and push
+## 6. Stage, commit, and push
 
 - Stage all relevant changed files including `CHANGELOG.md` (avoid secrets, .env, credentials)
 - Write a **very short** commit message (under 50 chars, no scope prefix needed)
@@ -56,7 +63,7 @@ git commit -m "the short message"
 git push origin main
 ```
 
-## 6. Tag and push tag
+## 7. Tag and push tag
 
 If the tag already exists (e.g. failed release), delete it locally and remotely first:
 
@@ -72,7 +79,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-## 7. Verify release
+## 8. Verify release
 
 Check that the Release pipeline triggered by the tag is running:
 
