@@ -11,7 +11,7 @@ name = "pytest_difftest_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
 rustpython-parser = "0.3"
 rustpython-parser-core = "0.3"
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }
